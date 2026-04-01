@@ -112,7 +112,7 @@ fn determine_double_lanes(preceding_row: Option<&RowData>) -> (u32, u32) {
 
 fn get_random_row_type() -> RowType {
     let mut rng = rand::thread_rng();
-    let rand: f64 = rng.gen();
+    let rand: f64 = rng.r#gen();
     if rand < ROW_TYPE_THRESHOLD_1 {
         RowType::SingleTileRow
     } else if rand < ROW_TYPE_THRESHOLD_2 {
@@ -132,7 +132,7 @@ pub fn generate_all_rows(row_count: usize) -> Vec<RowData> {
     rows.push(start_row);
 
     for i in 1..=row_count {
-        let height_multiplier = 1 + (rng.gen::<f32>() * 8.0) as u32;
+        let height_multiplier = 1 + (rng.r#gen::<f32>() * 8.0) as u32;
         let row_height = height_multiplier as f32 * BASE_ROW_HEIGHT;
         current_y -= row_height;
 

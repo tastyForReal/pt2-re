@@ -4,7 +4,7 @@ use super::bitmap_font_renderer::BitmapFontRenderer;
 use super::gpu_context::GpuContext;
 use super::score_renderer::ScoreRenderer;
 use super::sprite_renderer::{RenderSpriteOptions, SpriteRenderer};
-use super::tile_renderer::{push_rect, TileRenderer, TileVertex};
+use super::tile_renderer::{TileRenderer, TileVertex, push_rect};
 use crate::game::score_types::ScoreData;
 use crate::game::types::*;
 

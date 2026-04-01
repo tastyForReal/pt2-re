@@ -7,7 +7,7 @@ description = "A FOSS Piano Tiles 2 clone"
 [features]
 default = []
 audio = ["dep:rodio"]
-soundfont = ["dep:fluidlite"]
+soundfont = ["dep:fluidlite", "audio"]
 
 [dependencies]
 wgpu = "24"

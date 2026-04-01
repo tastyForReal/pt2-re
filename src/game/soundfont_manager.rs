@@ -506,8 +506,7 @@ mod fluidlite_impl {
         #[cfg(feature = "soundfont")]
         fn try_into_fluidlite(self: Box<Self>) -> Option<FluidLiteSynth> {
             // We need to extract the inner synth. This requires accessing the internal fields.
-            // Since we can't move out of Box<Self>, we use a workaround via std::any::Any.
-            use std::any::Any;
+            // Since we can't move out of Box<Self>, we use a workaround.
             // This is a workaround - in practice FluidLiteSynth is not dynSafe for this operation.
             // We'll handle this differently in audio_manager.rs by storing FluidLiteSynth directly.
             None
@@ -591,6 +590,13 @@ mod fluidlite_impl {
             synth_arc
         }
 
+        /// Clone the inner synth Arc without consuming self.
+        /// This allows both the AudioManager (for note control) and the mixer (for audio output)
+        /// to share the same synthesizer.
+        pub fn clone_synth_arc(&self) -> Arc<std::sync::Mutex<Option<fluidlite::Synth>>> {
+            self.synth.clone()
+        }
+
         pub fn sample_rate(&self) -> u32 {
             self.sample_rate
         }
@@ -642,25 +648,90 @@ mod fluidlite_impl {
         fn total_duration(&self) -> Option<Duration> {
             None // Infinite duration
         }
-
-        pub fn into_synth(mut self) -> Arc<std::sync::Mutex<Option<fluidlite::Synth>>> {
-            let synth_arc = self.synth.clone();
-            self.synth = Arc::new(std::sync::Mutex::new(None));
-            synth_arc
-        }
-
-        pub fn sample_rate_value(&self) -> u32 {
-            self.sample_rate
-        }
     }
 
     /// Extract the inner synthesizer from this source for use with the SoundfontSynth trait.
     /// After calling this, the SoundfontSource is no longer usable for audio output.
-    pub fn into_synth_global(synth: SoundfontSource) -> Arc<std::sync::Mutex<Option<fluidlite::Synth>>> {
+    pub fn into_synth_global(
+        synth: SoundfontSource,
+    ) -> Arc<std::sync::Mutex<Option<fluidlite::Synth>>> {
         // Take the synth from the Arc
         let synth_arc = synth.synth.clone();
         synth_arc
     }
+
+    /// A wrapper that implements SoundfontSynth by holding an Arc to the raw synthesizer.
+    /// This allows the trait object to be stored in AudioManager while the SoundfontSource
+    /// (which feeds audio into the rodio mixer) holds its own Arc clone.
+    pub struct ArcSoundfontSynth {
+        synth: Arc<std::sync::Mutex<Option<fluidlite::Synth>>>,
+        loaded: AtomicBool,
+    }
+
+    impl ArcSoundfontSynth {
+        pub fn new(synth: Arc<std::sync::Mutex<Option<fluidlite::Synth>>>) -> Self {
+            let loaded = synth.lock().ok().map_or(false, |g| g.is_some());
+            Self {
+                synth,
+                loaded: AtomicBool::new(loaded),
+            }
+        }
+    }
+
+    impl SoundfontSynth for ArcSoundfontSynth {
+        fn note_on(&self, channel: u8, note: u8, velocity: u8) {
+            if let Ok(guard) = self.synth.lock() {
+                if let Some(ref synth) = *guard {
+                    synth
+                        .note_on(channel.into(), note.into(), velocity.into())
+                        .ok();
+                }
+            }
+        }
+
+        fn note_off(&self, channel: u8, note: u8) {
+            if let Ok(guard) = self.synth.lock() {
+                if let Some(ref synth) = *guard {
+                    synth.note_off(channel.into(), note.into()).ok();
+                }
+            }
+        }
+
+        fn all_notes_off(&self) {
+            if let Ok(guard) = self.synth.lock() {
+                if let Some(ref synth) = *guard {
+                    #[allow(unused_must_use)]
+                    synth.system_reset();
+                }
+            }
+        }
+
+        fn is_ready(&self) -> bool {
+            self.loaded.load(Ordering::SeqCst)
+        }
+
+        fn state(&self) -> SoundfontState {
+            if self.is_ready() {
+                SoundfontState::Ready
+            } else {
+                SoundfontState::Uninitialized
+            }
+        }
+
+        fn config(&self) -> Option<SoundfontConfig> {
+            None
+        }
+
+        fn reset(&self) {
+            self.all_notes_off();
+        }
+
+        #[cfg(feature = "soundfont")]
+        fn try_into_fluidlite(self: Box<Self>) -> Option<FluidLiteSynth> {
+            None
+        }
+    }
+} // end mod fluidlite_impl
 
 // =============================================================================
 // Mock Implementation for non-soundfont builds

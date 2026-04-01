@@ -1,6 +1,6 @@
 use wgpu::util::DeviceExt;
 // No imports needed here anymore
-use super::spritesheet_parser::{parse_spritesheet, SpriteFrame, SpritesheetData};
+use super::spritesheet_parser::{SpriteFrame, SpritesheetData, parse_spritesheet};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]

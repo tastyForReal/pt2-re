@@ -25,10 +25,7 @@ enum CliGameMode {
 
 /// Piano Tiles Re:U — a tile-tapping rhythm game.
 #[derive(Parser, Debug)]
-#[command(
-    name = "pt2",
-    about = "Rust FOSS clone of \"Piano Tiles 2\""
-)]
+#[command(name = "pt2", about = "Rust FOSS clone of \"Piano Tiles 2\"")]
 struct Cli {
     /// Path to a JSON level file to load on startup.
     #[arg(short, long)]
@@ -592,7 +589,9 @@ fn main() {
     #[cfg(not(feature = "soundfont"))]
     let log_config = format!("{},symphonia_bundle_mp3=warn,wgpu_hal=warn", base_level);
 
-    std::env::set_var("RUST_LOG", log_config);
+    unsafe {
+        std::env::set_var("RUST_LOG", log_config);
+    }
     env_logger::init();
 
     log::info!("Piano Tiles Re:U starting...");

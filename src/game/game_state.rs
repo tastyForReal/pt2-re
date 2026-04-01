@@ -720,11 +720,7 @@ fn determine_double_lanes(preceding_row: Option<&RowData>) -> (u32, u32) {
             _ => {}
         }
     }
-    if rng.gen_bool(0.5) {
-        (0, 2)
-    } else {
-        (1, 3)
-    }
+    if rng.gen_bool(0.5) { (0, 2) } else { (1, 3) }
 }
 
 pub fn handle_tile_press(

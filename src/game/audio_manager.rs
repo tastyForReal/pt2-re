@@ -1,4 +1,4 @@
-use super::midi_types::{midi_to_note, MidiJson};
+use super::midi_types::{MidiJson, midi_to_note};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -12,8 +12,8 @@ use std::time::Duration;
 // Soundfont imports - conditionally compiled
 #[cfg(feature = "soundfont")]
 use super::soundfont_manager::{
-    validate_soundfont_path, FluidLiteSynth, SoundfontConfig, SoundfontError, SoundfontResult,
-    SoundfontSource, SoundfontState, SoundfontSynth,
+    ArcSoundfontSynth, FluidLiteSynth, SoundfontConfig, SoundfontError, SoundfontResult,
+    SoundfontSource, SoundfontState, SoundfontSynth, validate_soundfont_path,
 };
 
 /// Internal representation of a pre-decoded audio sample.
@@ -379,8 +379,10 @@ impl AudioManager {
         match synth.load_soundfont(config) {
             Ok(()) => {
                 // Create SoundfontSource to feed audio to the mixer
-                let mut source = SoundfontSource::new(synth);
-                let synth_arc = source.into_synth();
+                let source = SoundfontSource::from_fluidlite(synth);
+
+                // Clone the synth arc before the source is moved into the mixer
+                let synth_arc = source.clone_synth_arc();
 
                 // Wrap in ArcSoundfontSynth for the trait object
                 let wrapped_synth = ArcSoundfontSynth::new(synth_arc);
@@ -441,7 +443,7 @@ impl AudioManager {
     /// Start soundfont audio playback through the mixer.
     /// This must be called after successfully loading a soundfont to route its audio output.
     fn start_soundfont_playback(&mut self) {
-        if let Some(ref mut synth_box) = self.soundfont_synth {
+        if let Some(ref mut _synth_box) = self.soundfont_synth {
             // This requires restructuring - for now we handle it in load_soundfont
             // where we have access to the raw FluidLiteSynth
             log::debug!("Soundfont playback routing not yet implemented");
@@ -810,7 +812,7 @@ impl AudioManager {
         #[cfg(feature = "audio")]
         {
             // Resetting the mixer is the easiest way to stop all sounds.
-            if let (Some(handle), Some(ref mut old_sink)) = (&self.handle, &mut self._mixer_sink) {
+            if let (Some(handle), Some(old_sink)) = (&self.handle, &mut self._mixer_sink) {
                 old_sink.stop();
                 if let Some((controller, sink)) = create_mixer_and_sink(handle) {
                     self.mixer_controller = Some(controller);
