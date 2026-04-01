@@ -116,13 +116,11 @@ pub fn update_game_over_animation(data: &mut GameData, current_time: f64) {
 }
 
 pub fn update_game_won(data: &mut GameData, current_time: f64) {
-    if data.state == GameState::Cleared {
-        if let Some(won_time) = data.game_won_time {
-            // No auto-reset yet, but we could add it if desired.
-            // TS does it after 1000ms.
-            if current_time - won_time >= 1000.0 {
-                // reset(data);
-            }
+    if data.state == GameState::Cleared
+        && let Some(won_time) = data.game_won_time
+    {
+        if current_time - won_time >= 1000.0 {
+            log::debug!("Game won! (TODO: reset game data)");
         }
     }
 }
@@ -329,12 +327,11 @@ fn get_scroll_speed(data: &GameData) -> f32 {
 }
 
 fn update_challenge_tps(data: &mut GameData, dt: f64) {
-    if data.game_mode == GameMode::Survival {
-        if let Some(ref cfg) = data.endless_config {
-            if let Some(acc) = cfg.acceleration_rate {
-                data.current_tps += acc * dt as f32;
-            }
-        }
+    if data.game_mode == GameMode::Survival
+        && let Some(ref cfg) = data.endless_config
+        && let Some(acc) = cfg.acceleration_rate
+    {
+        data.current_tps += acc * dt as f32;
     }
 }
 
@@ -366,13 +363,13 @@ fn play_tile_sound(midi_loaded: bool, audio_manager: &AudioManager) {
 
 fn update_active_row(data: &mut GameData, audio_manager: &mut AudioManager, current_time: f64) {
     let active_idx = data.active_row_index;
-    if let Some(row) = data.rows.get(active_idx) {
-        if row.row_type != RowType::StartingTileRow {
-            let screen_y = row.y_position + data.scroll_offset;
-            if screen_y > SCREEN_HEIGHT && !row.is_completed {
-                trigger_game_over_out_of_bounds(data, current_time, audio_manager);
-                return;
-            }
+    if let Some(row) = data.rows.get(active_idx)
+        && row.row_type != RowType::StartingTileRow
+    {
+        let screen_y = row.y_position + data.scroll_offset;
+        if screen_y > SCREEN_HEIGHT && !row.is_completed {
+            trigger_game_over_out_of_bounds(data, current_time, audio_manager);
+            return;
         }
     }
 
@@ -418,12 +415,13 @@ fn update_active_row(data: &mut GameData, audio_manager: &mut AudioManager, curr
     } else if data.game_mode == GameMode::OneRound {
         // Check for game won
         let has_incomplete = data.rows.iter().skip(active_idx).any(|r| !r.is_completed);
-        if !has_incomplete && !data.rows.is_empty() {
-            if let Some(last_row) = data.rows.last() {
-                let last_row_screen_y = last_row.y_position + data.scroll_offset;
-                if last_row_screen_y > SCREEN_HEIGHT {
-                    trigger_game_won(data, current_time);
-                }
+        if !has_incomplete
+            && !data.rows.is_empty()
+            && let Some(last_row) = data.rows.last()
+        {
+            let last_row_screen_y = last_row.y_position + data.scroll_offset;
+            if last_row_screen_y > SCREEN_HEIGHT {
+                trigger_game_won(data, current_time);
             }
         }
     }
@@ -492,17 +490,17 @@ fn check_and_handle_endless_loop(data: &mut GameData, audio_manager: &mut AudioM
         return;
     }
 
-    if let Some(last_music) = data.musics_metadata.last().cloned() {
-        if data.current_music_index == data.musics_metadata.len() - 1 {
-            let rows_per_loop = last_music.end_row_index;
-            let expected_total_rows = (data.loop_count as usize + 2) * rows_per_loop + 1;
+    if let Some(last_music) = data.musics_metadata.last().cloned()
+        && data.current_music_index == data.musics_metadata.len() - 1
+    {
+        let rows_per_loop = last_music.end_row_index;
+        let expected_total_rows = (data.loop_count as usize + 2) * rows_per_loop + 1;
 
-            if data.rows.len() < expected_total_rows {
-                append_level_loop(data, audio_manager);
-                let cleanup_threshold = data.active_row_index.saturating_sub(100);
-                data.note_indicators
-                    .retain(|ind| ind.row_index >= cleanup_threshold);
-            }
+        if data.rows.len() < expected_total_rows {
+            append_level_loop(data, audio_manager);
+            let cleanup_threshold = data.active_row_index.saturating_sub(100);
+            data.note_indicators
+                .retain(|ind| ind.row_index >= cleanup_threshold);
         }
     }
 }
@@ -745,28 +743,27 @@ pub fn handle_tile_press(
     // 1. Starting tile logic (can happen in Paused state)
     if data.state == GameState::Paused {
         let row = &data.rows[active_idx];
-        if row.row_type == RowType::StartingTileRow {
-            if let Some(tile) = row.tiles.first() {
-                if tile.lane_index == lane {
-                    if let Some(y) = y_coord {
-                        let screen_y = tile.y + data.scroll_offset;
-                        if y < screen_y || y > screen_y + tile.height {
-                            return false;
-                        }
-                    }
-                    // Success!
-                    let start_tile = &mut data.rows[active_idx].tiles[0];
-                    start_tile.is_pressed = true;
-                    start_tile.completed_at = Some(current_time);
-
-                    data.rows[active_idx].is_completed = true;
-                    data.state = GameState::Resumed;
-                    data.completed_rows_count += 1;
-                    data.current_dt_press_count = 0;
-                    update_active_row(data, audio_manager, current_time);
-                    return true;
+        if row.row_type == RowType::StartingTileRow
+            && let Some(tile) = row.tiles.first()
+            && tile.lane_index == lane
+        {
+            if let Some(y) = y_coord {
+                let screen_y = tile.y + data.scroll_offset;
+                if y < screen_y || y > screen_y + tile.height {
+                    return false;
                 }
             }
+            // Success!
+            let start_tile = &mut data.rows[active_idx].tiles[0];
+            start_tile.is_pressed = true;
+            start_tile.completed_at = Some(current_time);
+
+            data.rows[active_idx].is_completed = true;
+            data.state = GameState::Resumed;
+            data.completed_rows_count += 1;
+            data.current_dt_press_count = 0;
+            update_active_row(data, audio_manager, current_time);
+            return true;
         }
         return false;
     }
@@ -790,10 +787,11 @@ pub fn handle_tile_press(
             is_in_valid_y = true;
         }
     } else {
-        if let Some(y) = y_coord {
-            if y >= row_top && y <= row_bottom {
-                is_in_valid_y = true;
-            }
+        if let Some(y) = y_coord
+            && y >= row_top
+            && y <= row_bottom
+        {
+            is_in_valid_y = true;
         }
     }
 
@@ -822,12 +820,13 @@ pub fn handle_tile_press(
             let row_clone = data.rows[active_idx].clone();
             let is_long = row_clone.height_multiplier > 1.0;
 
-            if is_long && input_type == InputType::Mouse {
-                if let Some(y) = y_coord {
-                    let hit_zone_top = row_bottom - BASE_ROW_HEIGHT;
-                    if y < hit_zone_top || y > row_bottom {
-                        return true; // Match TS: consumed but do nothing
-                    }
+            if is_long
+                && input_type == InputType::Mouse
+                && let Some(y) = y_coord
+            {
+                let hit_zone_top = row_bottom - BASE_ROW_HEIGHT;
+                if y < hit_zone_top || y > row_bottom {
+                    return true; // Match TS: consumed but do nothing
                 }
             }
 
@@ -997,15 +996,15 @@ pub fn trigger_game_over_out_of_bounds(
     data.state = GameState::TileFellOffScreen;
 
     let active_idx = data.active_row_index;
-    if let Some(row) = data.rows.get(active_idx) {
-        if let Some(unpressed_tile) = row.tiles.iter().find(|t| !t.is_pressed) {
-            data.game_over_data = Some(GameOverFlashState {
-                tile: unpressed_tile.clone(),
-                start_time: current_time,
-                flash_count: 0,
-                is_flashing: true,
-            });
-        }
+    if let Some(row) = data.rows.get(active_idx)
+        && let Some(unpressed_tile) = row.tiles.iter().find(|t| !t.is_pressed)
+    {
+        data.game_over_data = Some(GameOverFlashState {
+            tile: unpressed_tile.clone(),
+            start_time: current_time,
+            flash_count: 0,
+            is_flashing: true,
+        });
     }
 
     let target_offset = calculate_reposition_offset(data);

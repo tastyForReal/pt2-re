@@ -85,9 +85,10 @@ impl std::fmt::Display for SoundfontError {
 impl std::error::Error for SoundfontError {}
 
 /// Current state of the soundfont synthesizer
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SoundfontState {
     /// Not yet initialized
+    #[default]
     Uninitialized,
     /// Currently loading soundfont
     Loading,
@@ -99,12 +100,6 @@ pub enum SoundfontState {
     Disabled,
     /// Unloading in progress
     Unloading,
-}
-
-impl Default for SoundfontState {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
 }
 
 /// Configuration for soundfont playback
@@ -444,39 +439,37 @@ mod fluidlite_impl {
 
     impl SoundfontSynth for FluidLiteSynth {
         fn note_on(&self, channel: u8, note: u8, velocity: u8) {
-            if self.loaded.load(Ordering::SeqCst) {
-                if let Ok(synth_guard) = self.synth.lock() {
-                    if let Some(ref synth) = *synth_guard {
-                        synth
-                            .note_on(channel.into(), note.into(), velocity.into())
-                            .ok();
-                        self.voice_count.fetch_add(1, Ordering::SeqCst);
-                        log::trace!("Note ON: ch={}, note={}, vel={}", channel, note, velocity);
-                    }
-                }
+            if self.loaded.load(Ordering::SeqCst)
+                && let Ok(synth_guard) = self.synth.lock()
+                && let Some(ref synth) = *synth_guard
+            {
+                synth
+                    .note_on(channel.into(), note.into(), velocity.into())
+                    .ok();
+                self.voice_count.fetch_add(1, Ordering::SeqCst);
+                log::trace!("Note ON: ch={}, note={}, vel={}", channel, note, velocity);
             }
         }
 
         fn note_off(&self, channel: u8, note: u8) {
-            if self.loaded.load(Ordering::SeqCst) {
-                if let Ok(synth_guard) = self.synth.lock() {
-                    if let Some(ref synth) = *synth_guard {
-                        synth.note_off(channel.into(), note.into()).ok();
-                        self.voice_count.fetch_sub(1, Ordering::SeqCst);
-                        log::trace!("Note OFF: ch={}, note={}", channel, note);
-                    }
-                }
+            if self.loaded.load(Ordering::SeqCst)
+                && let Ok(synth_guard) = self.synth.lock()
+                && let Some(ref synth) = *synth_guard
+            {
+                synth.note_off(channel.into(), note.into()).ok();
+                self.voice_count.fetch_sub(1, Ordering::SeqCst);
+                log::trace!("Note OFF: ch={}, note={}", channel, note);
             }
         }
 
         fn all_notes_off(&self) {
-            if let Ok(synth_guard) = self.synth.lock() {
-                if let Some(ref synth) = *synth_guard {
-                    #[allow(unused_must_use)]
-                    synth.system_reset();
-                    self.voice_count.store(0, Ordering::SeqCst);
-                    log::debug!("All notes off");
-                }
+            if let Ok(synth_guard) = self.synth.lock()
+                && let Some(ref synth) = *synth_guard
+            {
+                #[allow(unused_must_use)]
+                synth.system_reset();
+                self.voice_count.store(0, Ordering::SeqCst);
+                log::debug!("All notes off");
             }
         }
 
@@ -493,13 +486,13 @@ mod fluidlite_impl {
         }
 
         fn reset(&self) {
-            if let Ok(synth_guard) = self.synth.lock() {
-                if let Some(ref synth) = *synth_guard {
-                    #[allow(unused_must_use)]
-                    synth.system_reset();
-                    self.voice_count.store(0, Ordering::SeqCst);
-                    log::debug!("Synthesizer reset");
-                }
+            if let Ok(synth_guard) = self.synth.lock()
+                && let Some(ref synth) = *synth_guard
+            {
+                #[allow(unused_must_use)]
+                synth.system_reset();
+                self.voice_count.store(0, Ordering::SeqCst);
+                log::debug!("Synthesizer reset");
             }
         }
 
@@ -652,12 +645,11 @@ mod fluidlite_impl {
 
     /// Extract the inner synthesizer from this source for use with the SoundfontSynth trait.
     /// After calling this, the SoundfontSource is no longer usable for audio output.
+    #[allow(dead_code)]
     pub fn into_synth_global(
         synth: SoundfontSource,
     ) -> Arc<std::sync::Mutex<Option<fluidlite::Synth>>> {
-        // Take the synth from the Arc
-        let synth_arc = synth.synth.clone();
-        synth_arc
+        synth.synth.clone()
     }
 
     /// A wrapper that implements SoundfontSynth by holding an Arc to the raw synthesizer.
@@ -670,7 +662,7 @@ mod fluidlite_impl {
 
     impl ArcSoundfontSynth {
         pub fn new(synth: Arc<std::sync::Mutex<Option<fluidlite::Synth>>>) -> Self {
-            let loaded = synth.lock().ok().map_or(false, |g| g.is_some());
+            let loaded = synth.lock().ok().is_some_and(|g| g.is_some());
             Self {
                 synth,
                 loaded: AtomicBool::new(loaded),
@@ -680,29 +672,29 @@ mod fluidlite_impl {
 
     impl SoundfontSynth for ArcSoundfontSynth {
         fn note_on(&self, channel: u8, note: u8, velocity: u8) {
-            if let Ok(guard) = self.synth.lock() {
-                if let Some(ref synth) = *guard {
-                    synth
-                        .note_on(channel.into(), note.into(), velocity.into())
-                        .ok();
-                }
+            if let Ok(guard) = self.synth.lock()
+                && let Some(ref synth) = *guard
+            {
+                synth
+                    .note_on(channel.into(), note.into(), velocity.into())
+                    .ok();
             }
         }
 
         fn note_off(&self, channel: u8, note: u8) {
-            if let Ok(guard) = self.synth.lock() {
-                if let Some(ref synth) = *guard {
-                    synth.note_off(channel.into(), note.into()).ok();
-                }
+            if let Ok(guard) = self.synth.lock()
+                && let Some(ref synth) = *guard
+            {
+                synth.note_off(channel.into(), note.into()).ok();
             }
         }
 
         fn all_notes_off(&self) {
-            if let Ok(guard) = self.synth.lock() {
-                if let Some(ref synth) = *guard {
-                    #[allow(unused_must_use)]
-                    synth.system_reset();
-                }
+            if let Ok(guard) = self.synth.lock()
+                && let Some(ref synth) = *guard
+            {
+                #[allow(unused_must_use)]
+                synth.system_reset();
             }
         }
 

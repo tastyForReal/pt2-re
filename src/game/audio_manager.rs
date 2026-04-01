@@ -440,6 +440,7 @@ impl AudioManager {
     }
 
     #[cfg(feature = "soundfont")]
+    #[allow(dead_code)]
     /// Start soundfont audio playback through the mixer.
     /// This must be called after successfully loading a soundfont to route its audio output.
     fn start_soundfont_playback(&mut self) {
@@ -658,14 +659,15 @@ impl AudioManager {
         #[cfg(feature = "soundfont")]
         {
             // Check if soundfont is available and enabled
-            if self.using_soundfont && self.soundfont_enabled {
-                if let Some(ref synth) = self.soundfont_synth {
-                    // Use velocity based on note or default to 100
-                    let velocity = (100u8).min(127);
-                    synth.note_on(0, midi_number, velocity);
-                    log::debug!("Soundfont note ON: midi={}", midi_number);
-                    return;
-                }
+            if self.using_soundfont
+                && self.soundfont_enabled
+                && let Some(ref synth) = self.soundfont_synth
+            {
+                // Use velocity based on note or default to 100
+                let velocity = 100u8;
+                synth.note_on(0, midi_number, velocity);
+                log::debug!("Soundfont note ON: midi={}", midi_number);
+                return;
             }
         }
 
@@ -746,17 +748,17 @@ impl AudioManager {
                 }
 
                 // If the sample exists (either from pre-load or a prior lazy-load), play it securely as zero-copy Arc.
-                if let Ok(sample_map) = self.samples.read() {
-                    if let Some(sample) = sample_map.get(filename) {
-                        log::debug!("Playing audio sample: {}", filename);
-                        let source = SharedSource {
-                            data: Arc::clone(&sample.data),
-                            channels: sample.channels,
-                            sample_rate: sample.sample_rate,
-                            pos: 0,
-                        };
-                        controller.add(source);
-                    }
+                if let Ok(sample_map) = self.samples.read()
+                    && let Some(sample) = sample_map.get(filename)
+                {
+                    log::debug!("Playing audio sample: {}", filename);
+                    let source = SharedSource {
+                        data: Arc::clone(&sample.data),
+                        channels: sample.channels,
+                        sample_rate: sample.sample_rate,
+                        pos: 0,
+                    };
+                    controller.add(source);
                 }
             }
         }
@@ -792,19 +794,19 @@ impl AudioManager {
     }
 
     pub fn add_dynamic_midi_note(&mut self, track_idx: usize, midi: u8, time: f64) {
-        if let Some(ref mut midi_data) = self.midi_data {
-            if let Some(track) = midi_data.tracks.get_mut(track_idx) {
-                track.notes.push(super::midi_types::MidiNote {
-                    midi,
-                    name: None,
-                    ticks: 0,
-                    time,
-                    duration: 0.5,
-                    duration_ticks: 0,
-                    velocity: 1.0,
-                    note_off_velocity: 0.0,
-                });
-            }
+        if let Some(ref mut midi_data) = self.midi_data
+            && let Some(track) = midi_data.tracks.get_mut(track_idx)
+        {
+            track.notes.push(super::midi_types::MidiNote {
+                midi,
+                name: None,
+                ticks: 0,
+                time,
+                duration: 0.5,
+                duration_ticks: 0,
+                velocity: 1.0,
+                note_off_velocity: 0.0,
+            });
         }
     }
 

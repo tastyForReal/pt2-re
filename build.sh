@@ -99,7 +99,7 @@ cargo build --features "soundfont"
 echo "==> Running cargo fmt"
 cargo fmt
 
-echo "==> Running cargo clippy -- -D \"warnings\""
-cargo clippy -- -D "warnings"
+echo "==> Running cargo clippy --features \"soundfont\" -- -D \"warnings\""
+cargo clippy --features "soundfont" -- -D "warnings"
 
 echo "==> Build complete."

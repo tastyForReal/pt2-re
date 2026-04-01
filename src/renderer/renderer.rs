@@ -306,33 +306,33 @@ impl Renderer {
 
             // START text
             self.font_renderer.begin_frame();
-            if let Some((x, y, w, h)) = start_tile_data {
-                if self.font_renderer.is_loaded() {
-                    let text = "START";
-                    let max_scale = 0.6;
+            if let Some((x, y, w, h)) = start_tile_data
+                && self.font_renderer.is_loaded()
+            {
+                let text = "START";
+                let max_scale = 0.6;
 
-                    let scale = self
-                        .font_renderer
-                        .calculate_scale_to_fit(text, w, h, max_scale);
+                let scale = self
+                    .font_renderer
+                    .calculate_scale_to_fit(text, w, h, max_scale);
 
-                    let font_scale = scale * scale_w.min(scale_h);
-                    let tx = (x + w * 0.5) * scale_w;
-                    let ty = (y + h * 0.5) * scale_h;
+                let font_scale = scale * scale_w.min(scale_h);
+                let tx = (x + w * 0.5) * scale_w;
+                let ty = (y + h * 0.5) * scale_h;
 
-                    let opacity = if start_tile_pressed { 0.0 } else { 1.0 };
-                    self.font_renderer.render_text(
-                        text,
-                        tx,
-                        ty,
-                        font_scale,
-                        [1.0, 1.0, 1.0, opacity],
-                        0.0, // scroll offset already handled in ty calculation if needed, but START tile is fixed
-                        &gpu.device,
-                        &mut render_pass,
-                        0.5,
-                        0.5,
-                    );
-                }
+                let opacity = if start_tile_pressed { 0.0 } else { 1.0 };
+                self.font_renderer.render_text(
+                    text,
+                    tx,
+                    ty,
+                    font_scale,
+                    [1.0, 1.0, 1.0, opacity],
+                    0.0, // scroll offset already handled in ty calculation if needed, but START tile is fixed
+                    &gpu.device,
+                    &mut render_pass,
+                    0.5,
+                    0.5,
+                );
             }
 
             if self.score_renderer.is_ready() {
@@ -424,13 +424,14 @@ impl Renderer {
 
         let mut fade_opacity = 1.0;
         let mut should_render_progress = rect.progress > 0.0 && rect.progress < rect.height;
-        if rect.is_pressed && !rect.is_released_early {
-            if let Some(completed_at) = rect.completed_at {
-                let elapsed = now - completed_at;
-                if elapsed < FADE_DURATION {
-                    fade_opacity = 1.0 - (elapsed / FADE_DURATION) as f32;
-                    should_render_progress = true;
-                }
+        if rect.is_pressed
+            && !rect.is_released_early
+            && let Some(completed_at) = rect.completed_at
+        {
+            let elapsed = now - completed_at;
+            if elapsed < FADE_DURATION {
+                fade_opacity = 1.0 - (elapsed / FADE_DURATION) as f32;
+                should_render_progress = true;
             }
         }
 
@@ -676,18 +677,18 @@ impl Renderer {
             "tile_black.png"
         };
 
-        if rect.is_pressed {
-            if let Some(comp_at) = rect.completed_at {
-                let frame_index = ((now - comp_at) / ANIM_FRAME_TIME) as i32;
-                if frame_index == 1 {
-                    frame_name = "1.png";
-                } else if frame_index == 2 {
-                    frame_name = "2.png";
-                } else if frame_index == 3 {
-                    frame_name = "3.png";
-                } else if frame_index >= 4 {
-                    frame_name = "4.png";
-                }
+        if rect.is_pressed
+            && let Some(comp_at) = rect.completed_at
+        {
+            let frame_index = ((now - comp_at) / ANIM_FRAME_TIME) as i32;
+            if frame_index == 1 {
+                frame_name = "1.png";
+            } else if frame_index == 2 {
+                frame_name = "2.png";
+            } else if frame_index == 3 {
+                frame_name = "3.png";
+            } else if frame_index >= 4 {
+                frame_name = "4.png";
             }
         }
 

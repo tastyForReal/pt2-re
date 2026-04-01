@@ -119,26 +119,24 @@ fn parse_component(component: &str) -> ParsedComponent {
     let trimmed = component.trim();
 
     // Check for group pattern like 5<...>
-    if trimmed.len() >= 3 {
-        if let Some(first_char) = trimmed.chars().next() {
-            if first_char.is_ascii_digit()
-                && trimmed.chars().nth(1) == Some('<')
-                && trimmed.ends_with('>')
-            {
-                let type_id = first_char.to_digit(10).unwrap_or(0);
-                let group_content = &trimmed[2..trimmed.len() - 1];
-                let duration = extract_all_letters(group_content);
-                let original_type = if type_id == 5 {
-                    RowType::DoubleTileRow
-                } else {
-                    RowType::SingleTileRow
-                };
-                return ParsedComponent {
-                    duration,
-                    original_type,
-                };
-            }
-        }
+    if trimmed.len() >= 3
+        && let Some(first_char) = trimmed.chars().next()
+        && first_char.is_ascii_digit()
+        && trimmed.chars().nth(1) == Some('<')
+        && trimmed.ends_with('>')
+    {
+        let type_id = first_char.to_digit(10).unwrap_or(0);
+        let group_content = &trimmed[2..trimmed.len() - 1];
+        let duration = extract_all_letters(group_content);
+        let original_type = if type_id == 5 {
+            RowType::DoubleTileRow
+        } else {
+            RowType::SingleTileRow
+        };
+        return ParsedComponent {
+            duration,
+            original_type,
+        };
     }
 
     if is_only_rest_letters(trimmed) {
@@ -476,13 +474,12 @@ fn parse_track_score(score: &str, bpm: f64, base_beats: f64) -> ParsedTrack {
                     continue;
                 }
                 let la = chars.get(i).copied();
-                if let Some(la_ch) = la {
-                    if (la_ch == '>' || la_ch == '{' || la_ch == '}' || la_ch.is_ascii_digit())
-                        && mode == 5
-                    {
-                        i += 1;
-                        continue;
-                    }
+                if let Some(la_ch) = la
+                    && (la_ch == '>' || la_ch == '{' || la_ch == '}' || la_ch.is_ascii_digit())
+                    && mode == 5
+                {
+                    i += 1;
+                    continue;
                 }
 
                 // Collect token

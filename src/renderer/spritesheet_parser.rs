@@ -111,10 +111,10 @@ pub fn parse_spritesheet(plist_content: &str) -> Result<SpritesheetData, String>
                 if let Some(frames_dict) = children.get(i + 1) {
                     parse_frames(frames_dict, &mut data.frames);
                 }
-            } else if key_name == "metadata" {
-                if let Some(meta_dict) = children.get(i + 1) {
-                    parse_metadata(meta_dict, &mut data);
-                }
+            } else if key_name == "metadata"
+                && let Some(meta_dict) = children.get(i + 1)
+            {
+                parse_metadata(meta_dict, &mut data);
             }
         }
         i += 1;
