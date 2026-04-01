@@ -3,6 +3,39 @@ use super::row_generator;
 use super::score_manager::ScoreManager;
 use super::types::*;
 
+/// Calculates the accelerated BPM for the next music part in endless mode.
+/// - Normalize current speed as frequency (BPM / base_beats)
+/// - Apply growth multiplier: 1.3 - 0.1% for every unit above the pivot
+/// - Enforce a minimum 4% growth floor
+/// - Convert back to BPM using the next part's base beats
+fn calculate_infinite_bpm(
+    current_bpm: f64,
+    current_base_beats: f64,
+    next_base_beats: f64,
+    pivot: f64,
+) -> f64 {
+    // Guard against invalid base_beats values to prevent division by zero.
+    if current_base_beats <= 0.0 || next_base_beats <= 0.0 {
+        log::warn!(
+            "calculate_infinite_bpm: invalid base_beats (current={}, next={}), returning current BPM {:.1}",
+            current_base_beats,
+            next_base_beats,
+            current_bpm
+        );
+        return current_bpm;
+    }
+
+    // Normalize current speed (Frequency)
+    let current_frequency = current_bpm / current_base_beats;
+    // Calculate Growth Multiplier with a 4% minimum floor
+    let mut growth_factor = 1.3 - 0.001 * (current_frequency - pivot);
+    if growth_factor < 1.04 {
+        growth_factor = 1.04;
+    }
+    // Convert back to BPM
+    current_frequency * growth_factor * next_base_beats
+}
+
 pub fn update_scroll(
     data: &mut GameData,
     dt: f64,
@@ -15,7 +48,10 @@ pub fn update_scroll(
     }
 
     update_challenge_tps(data, dt);
-    check_and_update_music_for_row(data, data.active_row_index);
+    // Update music section index (but NOT TPS) every frame so that
+    // check_and_handle_endless_loop can correctly detect when the player
+    // is in the last section and trigger tile regeneration.
+    update_music_index(data, data.active_row_index);
 
     let scroll_speed = get_scroll_speed(data);
     let scroll_delta = scroll_speed * dt as f32;
@@ -37,8 +73,11 @@ pub fn update_scroll(
         }
 
         if data.midi_loaded {
-            let played_ids = audio_manager
-                .update_midi_playback(data.current_midi_time, &data.skipped_midi_notes);
+            let played_ids = audio_manager.update_midi_playback(
+                data.current_midi_time,
+                &data.skipped_midi_notes,
+                speed_multiplier as f64,
+            );
             spawn_note_hit_animations(data, &played_ids, current_time);
         }
     }
@@ -124,6 +163,32 @@ pub fn update_game_won(data: &mut GameData, current_time: f64) {
     }
 }
 
+/// Updates the current music section index (for section tracking, loop detection).
+/// Does NOT touch TPS — TPS is updated separately on tile press.
+fn update_music_index(data: &mut GameData, active_idx: usize) {
+    let row = match data.rows.get(active_idx) {
+        Some(r) => r,
+        None => return,
+    };
+    if row.row_type == RowType::StartingTileRow {
+        return;
+    }
+
+    let level_row_index = row.row_index.saturating_sub(1);
+    for (i, music) in data.musics_metadata.iter().enumerate() {
+        if level_row_index >= music.start_row_index && level_row_index < music.end_row_index {
+            if data.current_music_index != i {
+                data.current_music_index = i;
+            }
+            break;
+        }
+    }
+}
+
+/// Detects music section changes on tile press and updates TPS accordingly.
+/// Compares against prev_music_index_on_press (set on previous tile press)
+/// to detect a section transition, even if current_music_index was already
+/// updated during scroll by update_music_index.
 fn check_and_update_music_for_row(data: &mut GameData, active_idx: usize) {
     let row = match data.rows.get(active_idx) {
         Some(r) => r,
@@ -137,17 +202,30 @@ fn check_and_update_music_for_row(data: &mut GameData, active_idx: usize) {
     let mut new_music_idx = None;
     for (i, music) in data.musics_metadata.iter().enumerate() {
         if level_row_index >= music.start_row_index && level_row_index < music.end_row_index {
-            if data.current_music_index != i {
-                new_music_idx = Some(i);
-            }
+            new_music_idx = Some(i);
             break;
         }
     }
 
     if let Some(i) = new_music_idx {
         data.current_music_index = i;
-        if data.game_mode != GameMode::Survival {
-            data.current_tps = data.musics_metadata[i].tps;
+        // Only update TPS when the section actually changed since the last
+        // tile press (not during scroll). This matches the original game behaviour where
+        // speed changes only when the player hits the next part's first tile.
+        if data.prev_music_index_on_press != i {
+            data.prev_music_index_on_press = i;
+            if data.game_mode != GameMode::Survival {
+                let new_tps = data.musics_metadata[i].tps;
+                log::info!(
+                    "[section-change] row {} → music idx {} | TPS {:.3} → {:.3} (bpm={:.1})",
+                    active_idx,
+                    i,
+                    data.current_tps,
+                    new_tps,
+                    data.musics_metadata[i].bpm
+                );
+                data.current_tps = new_tps;
+            }
         }
     }
 }
@@ -204,6 +282,7 @@ pub fn update_bot(
                     data.has_game_started = true;
                     data.current_midi_time = 0.0;
                 }
+                check_and_update_music_for_row(data, active_idx);
                 for _ in 0..new_interactions {
                     update_midi_playback_for_row(data, &row_clone, audio_manager, current_time);
                     play_tile_sound(midi_loaded, audio_manager);
@@ -231,6 +310,7 @@ pub fn update_bot(
                     data.has_game_started = true;
                     data.current_midi_time = 0.0;
                 }
+                check_and_update_music_for_row(data, active_idx);
                 for _ in 0..hits {
                     update_midi_playback_for_row(data, &row_clone, audio_manager, current_time);
                     play_tile_sound(midi_loaded, audio_manager);
@@ -289,8 +369,21 @@ pub fn update_midi_playback_for_row(
     data.midi_playing = true;
 
     if data.midi_loaded {
-        let played_ids =
-            audio_manager.update_midi_playback(data.current_midi_time, &data.skipped_midi_notes);
+        let current_music_tps = data
+            .musics_metadata
+            .get(data.current_music_index)
+            .map(|m| m.tps)
+            .unwrap_or(DEFAULT_TPS);
+        let speed_multiplier = if current_music_tps > 0.0 {
+            (data.current_tps / current_music_tps) as f64
+        } else {
+            1.0
+        };
+        let played_ids = audio_manager.update_midi_playback(
+            data.current_midi_time,
+            &data.skipped_midi_notes,
+            speed_multiplier,
+        );
         spawn_note_hit_animations(data, &played_ids, current_time);
     }
 }
@@ -420,17 +513,20 @@ fn update_active_row(data: &mut GameData, audio_manager: &mut AudioManager, curr
         {
             let last_row_screen_y = last_row.y_position + data.scroll_offset;
             if last_row_screen_y > SCREEN_HEIGHT {
-                trigger_game_won(data, current_time);
+                trigger_game_won(data, current_time, audio_manager);
             }
         }
     }
 }
 
-fn trigger_game_won(data: &mut GameData, current_time: f64) {
+fn trigger_game_won(data: &mut GameData, current_time: f64, audio_manager: &mut AudioManager) {
     if data.state != GameState::Cleared {
         data.state = GameState::Cleared;
         data.game_won_time = Some(current_time);
     }
+    // Release all active MIDI notes so soundfont notes don't hang
+    // after the song ends (all gameplay modes).
+    audio_manager.clear_active_notes();
 }
 
 fn skip_notes_for_active_row(data: &mut GameData) {
@@ -489,13 +585,23 @@ fn check_and_handle_endless_loop(data: &mut GameData, audio_manager: &mut AudioM
         return;
     }
 
-    if let Some(last_music) = data.musics_metadata.last().cloned()
+    if !data.musics_metadata.is_empty()
         && data.current_music_index == data.musics_metadata.len() - 1
     {
-        let rows_per_loop = last_music.end_row_index;
+        // Use the raw level row count as the rows-per-loop constant so that
+        // the guard stays correct even after multiple loops have been appended
+        // (last_music.end_row_index grows with each loop's offset).
+        let rows_per_loop = data.raw_level_rows.len();
         let expected_total_rows = (data.loop_count as usize + 2) * rows_per_loop + 1;
 
         if data.rows.len() < expected_total_rows {
+            log::info!(
+                "[endless-loop] triggering append | loop_count={} | rows={} | expected={} | sections={}",
+                data.loop_count,
+                data.rows.len(),
+                expected_total_rows,
+                data.musics_metadata.len()
+            );
             append_level_loop(data, audio_manager);
             let cleanup_threshold = data.active_row_index.saturating_sub(100);
             data.note_indicators
@@ -607,24 +713,29 @@ fn append_level_loop(data: &mut GameData, audio_manager: &mut AudioManager) {
         .collect();
     let new_loop_offset = (data.loop_count as usize + 1) * original_total;
 
-    let mut tps_acc = data
-        .musics_metadata
-        .iter()
-        .rfind(|m| m.start_row_index < original_total)
-        .map(|m| m.tps)
-        .unwrap_or(DEFAULT_TPS);
+    // Use the BPM from the very last music part (i.e. the most recently
+    // appended loop's last section) as the starting point so that BPM
+    // accumulates correctly across loops.
+    let mut current_bpm = data.musics_metadata.last().map(|m| m.bpm).unwrap_or(120.0);
     for m in &original_musics {
-        if data.game_mode == GameMode::Endless {
-            tps_acc += 0.333;
-        }
+        let (tps, bpm) = if data.game_mode == GameMode::Endless {
+            // Pivot shifts to 130 after 3 complete laps (loop 3+).
+            // loop_count=0 → first repeat (lap 1), loop_count=2 → fourth repeat (lap 3).
+            let pivot: f64 = if (data.loop_count as usize + 1) >= 3 {
+                130.0
+            } else {
+                100.0
+            };
+            current_bpm = calculate_infinite_bpm(current_bpm, m.base_beats, m.base_beats, pivot);
+            let new_tps = (current_bpm / m.base_beats / 60.0) as f32;
+            (new_tps, current_bpm)
+        } else {
+            (m.tps, m.bpm)
+        };
         data.musics_metadata.push(MusicMetadata {
             id: m.id,
-            tps: if data.game_mode == GameMode::Endless {
-                tps_acc
-            } else {
-                m.tps
-            },
-            bpm: m.bpm,
+            tps,
+            bpm,
             base_beats: m.base_beats,
             start_row_index: m.start_row_index + new_loop_offset,
             end_row_index: m.end_row_index + new_loop_offset,
@@ -986,6 +1097,9 @@ pub fn trigger_game_over_misclicked(
         is_flashing: true,
     });
     data.state = GameState::TileMisclicked;
+    // Release all active MIDI notes so soundfont notes don't ring
+    // over the game-over state (all gameplay modes).
+    audio_manager.clear_active_notes();
     audio_manager.play_game_over_chord();
 }
 
@@ -1010,6 +1124,10 @@ pub fn trigger_game_over_out_of_bounds(
             is_flashing: true,
         });
     }
+
+    // Release all active MIDI notes so soundfont notes don't ring
+    // over the game-over state (all gameplay modes).
+    audio_manager.clear_active_notes();
 
     let target_offset = calculate_reposition_offset(data);
     data.game_over_animation = Some(GameOverAnimationState {
@@ -1087,6 +1205,7 @@ pub fn create_game_data(
         current_filename: filename,
         raw_level_rows,
         loop_0_midi_notes: Vec::new(),
+        prev_music_index_on_press: 0,
     };
     let timings = calculate_level_row_timings(&data.rows, &data.musics_metadata);
     data.level_row_timings = timings;

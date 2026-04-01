@@ -985,26 +985,6 @@ fn convert_to_midi_json(parts: &[ParsedPart]) -> MidiJson {
     }
 }
 
-fn ticks_to_seconds(ticks: i64, tempos: &[MidiTempo], ppq: u32) -> f64 {
-    let mut time = 0.0;
-    let mut current_ticks = 0i64;
-    let mut current_bpm = tempos.first().map_or(120.0, |t| t.bpm);
-
-    for tempo in tempos {
-        if tempo.ticks >= ticks {
-            break;
-        }
-        let delta = tempo.ticks - current_ticks;
-        time += (delta as f64 / ppq as f64) * (60.0 / current_bpm);
-        current_ticks = tempo.ticks;
-        current_bpm = tempo.bpm;
-    }
-
-    let remaining = ticks - current_ticks;
-    time += (remaining as f64 / ppq as f64) * (60.0 / current_bpm);
-    time
-}
-
 fn align_tracks_across_parts(parts: &mut [ParsedPart]) {
     let mut max_tracks = 0;
     for part in parts.iter() {

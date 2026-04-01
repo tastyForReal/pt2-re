@@ -1,4 +1,4 @@
-use super::midi_types::{MidiJson, midi_to_note};
+use super::midi_types::{MidiJson, midi_to_note, ticks_to_seconds};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -643,11 +643,16 @@ impl AudioManager {
         &mut self,
         current_time: f64,
         _skipped_note_ids: &[i64],
+        speed_multiplier: f64,
     ) -> Vec<i64> {
         let midi_data = match &self.midi_data {
             Some(m) => m,
             None => return Vec::new(),
         };
+
+        // Collect header info for tick-based duration conversion
+        let ppq = midi_data.header.ppq;
+        let tempos = &midi_data.header.tempos;
 
         let mut played_note_ids = Vec::new();
         let mut notes_to_play = Vec::new();
@@ -674,9 +679,34 @@ impl AudioManager {
                         if !is_skipped && note.midi >= 21 && note.midi <= 108 {
                             notes_to_play.push(note.midi);
 
-                            // Track the note for note_off scheduling
-                            let end_time = note.time + note.duration;
-                            if note.duration > 0.0 {
+                            // Tick-based note_off scheduling:
+                            // Use duration_ticks (raw tick count) converted to seconds
+                            // via ticks_to_seconds for accurate tempo-aware duration,
+                            // then scale by speed_multiplier for playback sync.
+                            let end_time = if note.duration_ticks > 0 {
+                                let end_tick = note.ticks + note.duration_ticks;
+                                let duration_in_secs =
+                                    ticks_to_seconds(end_tick, tempos, ppq) - note.time;
+                                // Scale by speed_multiplier so that the soundfont note
+                                // sustains for its original real-time duration regardless
+                                // of how fast the MIDI clock advances.
+                                let scaled_duration = if speed_multiplier > 0.0 {
+                                    duration_in_secs * speed_multiplier
+                                } else {
+                                    duration_in_secs
+                                };
+                                note.time + scaled_duration
+                            } else {
+                                // Fallback for dynamic notes without tick data
+                                let scaled_duration = if speed_multiplier > 0.0 {
+                                    note.duration * speed_multiplier
+                                } else {
+                                    note.duration
+                                };
+                                note.time + scaled_duration
+                            };
+
+                            if note.duration > 0.0 || note.duration_ticks > 0 {
                                 self.active_notes.push(ActiveNote {
                                     midi_number: note.midi,
                                     end_time,

@@ -236,6 +236,7 @@ pub struct GameData {
     pub current_filename: String,
     pub raw_level_rows: Vec<RowTypeResult>,
     pub loop_0_midi_notes: Vec<Loop0MidiNote>,
+    pub prev_music_index_on_press: usize,
 }
 
 #[derive(Debug, Clone)]
