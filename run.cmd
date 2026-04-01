@@ -1,0 +1,1 @@
+cargo run --features "audio,soundfont" -- --autoplay --gamemode one-round --preload-samples --file "C:\a\tests\midi_export.json"
