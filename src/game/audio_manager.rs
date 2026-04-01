@@ -756,6 +756,24 @@ impl AudioManager {
         }
     }
 
+    /// Clear all tracked active notes, sending proper note_off for each.
+    /// This should be called when a song loop transitions to prevent stale
+    /// note_off events from the previous loop from killing notes in the new loop.
+    pub fn clear_active_notes(&mut self) {
+        // Send release for every active note (important for soundfont synthesis
+        // to play proper release envelopes rather than hard-cutting)
+        for note in &self.active_notes {
+            self.play_note_off_by_midi(note.midi_number);
+        }
+        if !self.active_notes.is_empty() {
+            log::debug!(
+                "Cleared {} active notes on loop transition",
+                self.active_notes.len()
+            );
+        }
+        self.active_notes.clear();
+    }
+
     pub fn play_sample(&self, filename: &str) {
         #[cfg(feature = "audio")]
         {

@@ -688,6 +688,11 @@ fn append_level_loop(data: &mut GameData, audio_manager: &mut AudioManager) {
         }
     }
 
+    // Clear active note tracking from the previous loop so that stale note_off
+    // events (scheduled at end_times from the old loop) don't kill notes that
+    // are re-triggered in the new loop with the same MIDI number.
+    audio_manager.clear_active_notes();
+
     data.note_indicators.extend(new_indicators);
     data.loop_count += 1;
 }
