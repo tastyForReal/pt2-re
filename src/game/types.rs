@@ -245,4 +245,5 @@ pub struct Loop0MidiNote {
     pub original_time: f64,
     pub row_index: usize,
     pub time_fraction: f64,
+    pub duration: f64,
 }

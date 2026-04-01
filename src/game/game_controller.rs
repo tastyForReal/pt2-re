@@ -108,6 +108,7 @@ impl GameController {
                             original_time: note.time,
                             row_index: target_row_index as usize,
                             time_fraction: target_fraction,
+                            duration: note.duration,
                         });
                     }
                 }

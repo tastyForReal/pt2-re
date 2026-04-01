@@ -684,7 +684,7 @@ fn append_level_loop(data: &mut GameData, audio_manager: &mut AudioManager) {
         if let Some(nr_timing) = new_timings.get(new_row_idx.saturating_sub(1)) {
             let new_time = nr_timing.start_time
                 + mn.time_fraction * (nr_timing.end_time - nr_timing.start_time);
-            audio_manager.add_dynamic_midi_note(mn.track_idx, mn.midi, new_time);
+            audio_manager.add_dynamic_midi_note(mn.track_idx, mn.midi, new_time, mn.duration);
         }
     }
 

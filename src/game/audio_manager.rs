@@ -889,7 +889,7 @@ impl AudioManager {
         self.play_sample("g.mp3");
     }
 
-    pub fn add_dynamic_midi_note(&mut self, track_idx: usize, midi: u8, time: f64) {
+    pub fn add_dynamic_midi_note(&mut self, track_idx: usize, midi: u8, time: f64, duration: f64) {
         if let Some(ref mut midi_data) = self.midi_data
             && let Some(track) = midi_data.tracks.get_mut(track_idx)
         {
@@ -898,7 +898,7 @@ impl AudioManager {
                 name: None,
                 ticks: 0,
                 time,
-                duration: 0.5,
+                duration,
                 duration_ticks: 0,
                 velocity: 1.0,
                 note_off_velocity: 0.0,
