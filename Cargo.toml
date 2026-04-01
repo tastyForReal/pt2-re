@@ -5,7 +5,7 @@ edition = "2024"
 description = "A FOSS Piano Tiles 2 clone"
 
 [features]
-default = ["audio"]
+default = []
 audio = ["dep:rodio"]
 soundfont = ["dep:fluidlite"]
 
