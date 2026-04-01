@@ -118,10 +118,9 @@ pub fn update_game_over_animation(data: &mut GameData, current_time: f64) {
 pub fn update_game_won(data: &mut GameData, current_time: f64) {
     if data.state == GameState::Cleared
         && let Some(won_time) = data.game_won_time
+        && current_time - won_time >= 1000.0
     {
-        if current_time - won_time >= 1000.0 {
-            log::debug!("Game won! (TODO: reset game data)");
-        }
+        log::debug!("Game won! (TODO: reset game data)");
     }
 }
 

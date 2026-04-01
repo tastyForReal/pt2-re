@@ -119,10 +119,17 @@ impl Source for InfiniteMixerSource {
 }
 
 /// Audio manager: tracks MIDI-derived sounds and playback state.
+/// Tracks a note that has been triggered (note_on) and is awaiting note_off.
+struct ActiveNote {
+    midi_number: u8,
+    end_time: f64,
+}
+
 pub struct AudioManager {
     midi_data: Option<MidiJson>,
     track_pointers: Vec<usize>,
     played_notes: HashSet<i64>,
+    active_notes: Vec<ActiveNote>,
 
     #[cfg(feature = "audio")]
     _stream: Option<OutputStream>,
@@ -154,6 +161,10 @@ pub struct AudioManager {
     soundfont_path: Option<String>,
     #[cfg(feature = "soundfont")]
     soundfont_playback_active: bool,
+    #[cfg(feature = "soundfont")]
+    soundfont_synth_arc: Option<Arc<std::sync::Mutex<Option<fluidlite::Synth>>>>,
+    #[cfg(feature = "soundfont")]
+    soundfont_sample_rate: u32,
 }
 
 /// Create a mixer + infinite wrapper and attach to a Sink.
@@ -204,6 +215,7 @@ impl AudioManager {
             midi_data: None,
             track_pointers: Vec::new(),
             played_notes: HashSet::new(),
+            active_notes: Vec::new(),
 
             #[cfg(feature = "audio")]
             _stream: stream,
@@ -235,6 +247,10 @@ impl AudioManager {
             soundfont_path: None,
             #[cfg(feature = "soundfont")]
             soundfont_playback_active: false,
+            #[cfg(feature = "soundfont")]
+            soundfont_synth_arc: None,
+            #[cfg(feature = "soundfont")]
+            soundfont_sample_rate: 44100,
         }
     }
 
@@ -384,6 +400,11 @@ impl AudioManager {
                 // Clone the synth arc before the source is moved into the mixer
                 let synth_arc = source.clone_synth_arc();
 
+                // Store the synth arc and sample rate so we can recreate the
+                // SoundfontSource if the mixer is rebuilt (e.g. stop_all_samples).
+                self.soundfont_synth_arc = Some(synth_arc.clone());
+                self.soundfont_sample_rate = 44100;
+
                 // Wrap in ArcSoundfontSynth for the trait object
                 let wrapped_synth = ArcSoundfontSynth::new(synth_arc);
                 self.soundfont_synth = Some(Box::new(wrapped_synth));
@@ -489,11 +510,31 @@ impl AudioManager {
         }
 
         self.soundfont_synth = None;
+        self.soundfont_synth_arc = None;
         self.soundfont_state = SoundfontState::Uninitialized;
         self.using_soundfont = false;
         self.soundfont_path = None;
 
         log::info!("Soundfont unloaded");
+    }
+
+    #[cfg(feature = "soundfont")]
+    /// Re-add the soundfont source to the current mixer.
+    /// This must be called after the mixer is recreated (e.g. in stop_all_samples)
+    /// to restore audio output from the synthesizer.
+    fn readd_soundfont_to_mixer(&mut self) {
+        if !self.using_soundfont || !self.soundfont_enabled {
+            return;
+        }
+        let synth_arc = match &self.soundfont_synth_arc {
+            Some(arc) => arc.clone(),
+            None => return,
+        };
+        if let Some(ref controller) = self.mixer_controller {
+            let source = SoundfontSource::from_synth_arc(synth_arc, self.soundfont_sample_rate);
+            controller.add(source);
+            log::debug!("Soundfont source re-added to mixer after rebuild");
+        }
     }
 
     #[cfg(feature = "soundfont")]
@@ -586,6 +627,7 @@ impl AudioManager {
     pub fn reset_playback(&mut self) {
         self.track_pointers = vec![0; self.midi_data.as_ref().map(|m| m.tracks.len()).unwrap_or(0)];
         self.played_notes.clear();
+        self.active_notes.clear();
         self.stop_all_samples();
 
         #[cfg(feature = "soundfont")]
@@ -631,6 +673,15 @@ impl AudioManager {
                         let is_skipped = _skipped_note_ids.contains(&note_id);
                         if !is_skipped && note.midi >= 21 && note.midi <= 108 {
                             notes_to_play.push(note.midi);
+
+                            // Track the note for note_off scheduling
+                            let end_time = note.time + note.duration;
+                            if note.duration > 0.0 {
+                                self.active_notes.push(ActiveNote {
+                                    midi_number: note.midi,
+                                    end_time,
+                                });
+                            }
                         }
 
                         self.played_notes.insert(note_id);
@@ -638,6 +689,17 @@ impl AudioManager {
                     }
                 }
                 *pointer += 1;
+            }
+        }
+
+        // Send note_off for notes that have reached their end time
+        let mut i = 0;
+        while i < self.active_notes.len() {
+            if current_time >= self.active_notes[i].end_time {
+                let note = self.active_notes.remove(i);
+                self.play_note_off_by_midi(note.midi_number);
+            } else {
+                i += 1;
             }
         }
 
@@ -675,6 +737,22 @@ impl AudioManager {
         if let Some(note_name) = midi_to_note(midi_number) {
             let filename = format!("{}.mp3", note_name);
             self.play_sample(&filename);
+        }
+    }
+
+    /// Send a note_off event for the given MIDI number.
+    /// This is primarily important for soundfont synthesis, which sustains notes
+    /// until explicitly released, allowing the release envelope to play.
+    pub fn play_note_off_by_midi(&self, midi_number: u8) {
+        #[cfg(feature = "soundfont")]
+        {
+            if self.using_soundfont
+                && self.soundfont_enabled
+                && let Some(ref synth) = self.soundfont_synth
+            {
+                synth.note_off(0, midi_number);
+                log::debug!("Soundfont note OFF: midi={}", midi_number);
+            }
         }
     }
 
@@ -829,6 +907,11 @@ impl AudioManager {
             if let Some(ref synth) = self.soundfont_synth {
                 synth.all_notes_off();
             }
+
+            // Re-add the soundfont source to the newly created mixer.
+            // Without this, note_on() events fire but no audio is produced
+            // because the SoundfontSource that feeds the mixer was destroyed.
+            self.readd_soundfont_to_mixer();
         }
     }
 }

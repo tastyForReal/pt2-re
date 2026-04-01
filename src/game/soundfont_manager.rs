@@ -405,20 +405,9 @@ mod fluidlite_impl {
             let synth_guard = self.synth.lock().unwrap();
             if let Some(ref synth) = *synth_guard {
                 let stereo_frames = frames.min(buffer.len() / 2);
-                // fluidlite write method expects a buffer that implements IsSamples trait
-                // For f32 buffer, we use write_f32 with interleaved L/R pointers
+                let buf = &mut buffer[..stereo_frames * 2];
                 #[allow(unused_must_use)]
-                unsafe {
-                    synth.write_f32(
-                        stereo_frames,
-                        buffer.as_mut_ptr(),
-                        0,
-                        1,
-                        buffer.as_mut_ptr().add(1),
-                        0,
-                        1,
-                    );
-                }
+                synth.write(buf);
             }
         }
     }
@@ -554,24 +543,31 @@ mod fluidlite_impl {
     }
 
     impl SoundfontSource {
+        /// Create a new SoundfontSource from a shared synth Arc and sample rate.
+        /// This is used to recreate the source after a mixer rebuild (e.g. after stop_all_samples).
+        pub fn from_synth_arc(
+            synth: Arc<std::sync::Mutex<Option<fluidlite::Synth>>>,
+            sample_rate: u32,
+        ) -> Self {
+            let frames_per_fill = 512;
+            let buffer_size = frames_per_fill * 2; // stereo
+            Self {
+                synth,
+                buffer: vec![0.0; buffer_size],
+                pos: buffer_size, // Start with empty buffer to trigger refill
+                frames_per_fill,
+                sample_rate,
+                channels: 2,
+            }
+        }
         fn refill_buffer(&mut self) {
-            let mut guard = self.synth.lock().unwrap();
-            if let Some(ref mut synth) = *guard {
+            let guard = self.synth.lock().unwrap();
+            if let Some(ref synth) = *guard {
                 let stereo_frames = self.frames_per_fill;
                 self.buffer.resize(stereo_frames * 2, 0.0);
 
                 #[allow(unused_must_use)]
-                unsafe {
-                    synth.write_f32(
-                        stereo_frames,
-                        self.buffer.as_mut_ptr(),
-                        0,
-                        1,
-                        self.buffer.as_mut_ptr().add(1),
-                        0,
-                        1,
-                    );
-                }
+                synth.write(self.buffer.as_mut_slice());
                 self.pos = 0;
             }
             drop(guard);

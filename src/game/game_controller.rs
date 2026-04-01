@@ -252,9 +252,9 @@ impl GameController {
 
     pub fn toggle_pause(&mut self) {
         if !self.game_data.has_game_started {
-            // Cannot toggle resume if not started.
-            self.is_paused = true;
-            self.game_data.state = GameState::Paused;
+            // Game hasn't started yet — pressing P is a no-op.
+            // GameState is already Paused by default; don't set is_paused
+            // here because the start-tile handler won't clear it.
             return;
         }
         self.is_paused = !self.is_paused;
