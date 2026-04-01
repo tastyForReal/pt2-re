@@ -216,7 +216,7 @@ fn check_and_update_music_for_row(data: &mut GameData, active_idx: usize) {
             data.prev_music_index_on_press = i;
             if data.game_mode != GameMode::Survival {
                 let new_tps = data.musics_metadata[i].tps;
-                log::info!(
+                log::debug!(
                     "[section-change] row {} → music idx {} | TPS {:.3} → {:.3} (bpm={:.1})",
                     active_idx,
                     i,
@@ -595,7 +595,7 @@ fn check_and_handle_endless_loop(data: &mut GameData, audio_manager: &mut AudioM
         let expected_total_rows = (data.loop_count as usize + 2) * rows_per_loop + 1;
 
         if data.rows.len() < expected_total_rows {
-            log::info!(
+            log::debug!(
                 "[endless-loop] triggering append | loop_count={} | rows={} | expected={} | sections={}",
                 data.loop_count,
                 data.rows.len(),
