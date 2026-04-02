@@ -3,3 +3,4 @@
 
 pub mod game;
 pub mod renderer;
+pub mod video_recorder;

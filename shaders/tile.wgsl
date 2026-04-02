@@ -1,6 +1,8 @@
 struct Uniforms {
     screen_width: f32,
     screen_height: f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;

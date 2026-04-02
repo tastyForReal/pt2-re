@@ -39,7 +39,8 @@ impl TileRenderer {
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Tile Uniforms"),
-            size: 8,
+            // Padded to 16 bytes for GL ES 3.0 compatibility (min_uniform_buffer_offset_alignment)
+            size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -111,11 +112,9 @@ impl TileRenderer {
     }
 
     pub fn update_uniforms(&self, queue: &wgpu::Queue, width: f32, height: f32) {
-        queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::bytes_of(&[width, height]),
-        );
+        // Pad to 16 bytes for GL ES 3.0 compatibility
+        let padded: [f32; 4] = [width, height, 0.0, 0.0];
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&padded));
     }
 
     pub fn draw<'a>(

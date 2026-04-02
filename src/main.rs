@@ -12,8 +12,9 @@ use winit::{
 use pt2::game::game_controller::GameController;
 use pt2::game::json_level_reader;
 use pt2::game::types::*;
-use pt2::renderer::gpu_context::GpuContext;
+use pt2::renderer::gpu_context::{GpuContext, OffscreenTarget};
 use pt2::renderer::renderer::Renderer;
+use pt2::video_recorder::VideoRecorder;
 
 /// Game mode selection for CLI.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -72,6 +73,10 @@ struct Cli {
     #[arg(long, default_value_t = 0.01)]
     acceleration_rate: f32,
 
+    /// Path to output MP4 video file. Requires --autoplay and --gamemode one_round.
+    #[arg(long)]
+    output_video: Option<String>,
+
     /// Path to a SoundFont (.sf2) file for synthesis playback.
     /// Default: assets/sounds/sf2/piano.sf2
     /// Precedence: CLI > built-in default
@@ -102,6 +107,8 @@ struct App {
     assets_dir: String,
     #[cfg(feature = "soundfont")]
     soundfont_path: std::path::PathBuf,
+    /// Whether headless recording mode should bypass window/surface creation entirely.
+    headless_recording: bool,
 }
 
 /// Resolve soundfont path with cross-platform support.
@@ -181,6 +188,9 @@ impl App {
         #[cfg(feature = "soundfont")]
         let soundfont_path = resolve_soundfont_path(cli.soundfont.as_deref(), &exe_dir);
 
+        // Headless recording mode: no window/surface needed, use offscreen rendering only
+        let headless_recording = cli.output_video.is_some() && cli.headless;
+
         Self {
             window: None,
             gpu: None,
@@ -190,12 +200,91 @@ impl App {
             assets_dir,
             #[cfg(feature = "soundfont")]
             soundfont_path,
+            headless_recording,
         }
+    }
+
+    /// Initialize headless GPU context, renderer, audio, level, and run recording loop.
+    /// Returns false if initialization failed.
+    fn init_headless_recording(&mut self) -> bool {
+        log::info!("[HEADLESS] Initializing headless recording mode...");
+
+        // Mute all audio output during video recording — we only capture video frames,
+        // not audio. This prevents any sound from reaching the system audio device
+        // and saves CPU cycles by skipping soundfont synthesis entirely.
+        self.game_controller.audio_manager.set_muted(true);
+
+        // Create headless GPU context (no window/surface)
+        let gpu = match pollster::block_on(GpuContext::new_headless()) {
+            Ok(g) => g,
+            Err(e) => {
+                log::error!("[HEADLESS] Failed to create headless GPU context: {}", e);
+                return false;
+            }
+        };
+
+        let mut renderer = Renderer::new(&gpu.device, gpu.format);
+        renderer.initialize_font(&gpu.device, &gpu.queue, gpu.format, &self.assets_dir);
+
+        // Initialize audio samples
+        self.game_controller
+            .audio_manager
+            .initialize_samples(&self.assets_dir, self.cli.preload_samples);
+
+        // Initialize soundfont synthesis (soundfont feature only)
+        #[cfg(feature = "soundfont")]
+        {
+            if self.cli.soundfont_enabled {
+                let sf_path = self.soundfont_path.to_string_lossy();
+                match self
+                    .game_controller
+                    .audio_manager
+                    .load_soundfont(&sf_path, self.cli.soundfont_fallback)
+                {
+                    Ok(()) => {
+                        log::info!("[HEADLESS] Soundfont loaded: {:?}", self.soundfont_path);
+                    }
+                    Err(e) => {
+                        log::warn!("[HEADLESS] Soundfont failed (non-fatal): {}", e);
+                    }
+                }
+            }
+        }
+
+        // Load level
+        if let Some(ref file_path) = self.cli.file {
+            let path_owned = file_path.clone();
+            match self.load_level_with_gamemode(&path_owned) {
+                Ok(()) => log::info!("[HEADLESS] Loaded level: {}", path_owned),
+                Err(e) => {
+                    log::error!("[HEADLESS] Failed to load level: {}", e);
+                    return false;
+                }
+            }
+        }
+
+        self.gpu = Some(gpu);
+        self.renderer = Some(renderer);
+        true
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Headless recording: skip window creation entirely
+        if self.headless_recording {
+            if self.gpu.is_some() {
+                return;
+            }
+            if !self.init_headless_recording() {
+                log::error!("[HEADLESS] Initialization failed, exiting");
+            }
+            // Run recording loop directly (no event loop needed)
+            self.run_recording_loop_headless();
+            event_loop.exit();
+            return;
+        }
+
         if self.window.is_some() {
             return;
         }
@@ -283,8 +372,8 @@ impl ApplicationHandler for App {
         }
 
         // Load level from CLI if provided
-        if let Some(file_path) = self.cli.file.clone() {
-            match self.load_level_with_gamemode(&file_path) {
+        if let Some(ref file_path) = self.cli.file.clone() {
+            match self.load_level_with_gamemode(file_path) {
                 Ok(()) => log::info!("Loaded level from: {}", file_path),
                 Err(e) => {
                     log::error!("Failed to load level: {}", e);
@@ -304,6 +393,14 @@ impl ApplicationHandler for App {
 
         // Update window title if level was loaded
         self.update_window_title();
+
+        // Handle video recording with surface (non-headless): mute audio, run the recording loop, then exit.
+        if self.cli.output_video.is_some() {
+            self.game_controller.audio_manager.set_muted(true);
+            log::info!("[REC] Audio muted for video recording");
+            self.run_recording_loop_with_event_loop(event_loop);
+            return;
+        }
 
         if self.cli.headless {
             log::info!("Headless mode: Game completely loaded successfully. Exiting.");
@@ -381,7 +478,9 @@ impl ApplicationHandler for App {
                     ) {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost) => {
-                            gpu.resize(gpu.config.width, gpu.config.height);
+                            if let Some(config) = &gpu.config {
+                                gpu.resize(config.width, config.height);
+                            }
                         }
                         Err(wgpu::SurfaceError::OutOfMemory) => {
                             log::error!("Out of GPU memory!");
@@ -572,10 +671,212 @@ impl App {
             }
         }
     }
+
+    /// Run the deterministic video recording loop without an event loop (headless).
+    fn run_recording_loop_headless(&mut self) {
+        let output_path = match &self.cli.output_video {
+            Some(p) => p.clone(),
+            None => {
+                log::error!("[HEADLESS] output_video is None");
+                return;
+            }
+        };
+
+        log::info!(
+            "[REC] Starting headless video recording to: {}",
+            output_path
+        );
+        self.execute_recording(&output_path);
+    }
+
+    /// Run the deterministic video recording loop with a surface (non-headless).
+    fn run_recording_loop_with_event_loop(&mut self, event_loop: &ActiveEventLoop) {
+        let output_path = match &self.cli.output_video {
+            Some(p) => p.clone(),
+            None => {
+                log::error!("[REC] output_video is None in run_recording_loop");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        log::info!("[REC] Starting video recording to: {}", output_path);
+        self.execute_recording(&output_path);
+        event_loop.exit();
+    }
+
+    /// Core recording logic shared by headless and non-headless paths.
+    fn execute_recording(&mut self, output_path: &str) {
+        // Determine song duration from level_row_timings
+        let song_duration = self
+            .game_controller
+            .game_data
+            .level_row_timings
+            .last()
+            .map(|t| t.end_time)
+            .unwrap_or(0.0);
+
+        // Total frames: 1s pre-start + song duration + 1s post-completion
+        let total_frames = ((song_duration + 2.0) * 60.0) as usize;
+        log::info!(
+            "[REC] Song duration: {:.1}s, total frames: {}",
+            song_duration,
+            total_frames
+        );
+
+        // Create offscreen render target at game resolution
+        let width = SCREEN_WIDTH as u32;
+        let height = SCREEN_HEIGHT as u32;
+
+        let gpu = match &self.gpu {
+            Some(g) => g,
+            None => {
+                log::error!("[REC] GPU not initialized");
+                return;
+            }
+        };
+
+        let offscreen = OffscreenTarget::new(&gpu.device, width, height, gpu.format);
+
+        // Create video recorder
+        let mut video_recorder = match VideoRecorder::new(output_path, width, height, total_frames)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("[REC] Failed to create video recorder: {}", e);
+                return;
+            }
+        };
+
+        let renderer = match &mut self.renderer {
+            Some(r) => r,
+            None => {
+                log::error!("[REC] Renderer not initialized");
+                return;
+            }
+        };
+
+        let fps = 60;
+        let dt = 1.0 / fps as f64;
+        let start_clicked_at_frame = fps; // Click START after 1 second
+        let mut frame_count: usize = 0;
+        let mut post_completion_frames: usize = 0;
+        let mut start_clicked = false;
+        let mut game_won = false;
+
+        log::info!(
+            "[REC] Recording started ({} frames at {} FPS)...",
+            total_frames,
+            fps
+        );
+
+        loop {
+            // Update game state with fixed dt
+            self.game_controller.update_with_dt(dt);
+
+            // Check if we need to click START (after 1 second = 60 frames)
+            if !start_clicked && frame_count == start_clicked_at_frame {
+                self.game_controller.click_start_tile();
+                start_clicked = true;
+            }
+
+            // Render frame to buffer
+            let score_data = self.game_controller.score_manager.get_score_data().clone();
+            let current_time_ms = self.game_controller.get_accumulated_time_ms();
+
+            let pixels = renderer.render_frame_to_bytes(
+                &gpu.device,
+                &gpu.queue,
+                &offscreen,
+                &self.game_controller.game_data,
+                &score_data,
+                current_time_ms,
+            );
+
+            // Send to video recorder
+            if let Err(e) = video_recorder.write_frame(&pixels) {
+                log::error!("[REC] Failed to write frame {}: {}", frame_count, e);
+                return;
+            }
+
+            // Log progress every 300 frames (every 5 seconds)
+            if frame_count.is_multiple_of(300) {
+                log::info!(
+                    "[REC] Frame {}/{} ({:.1}%)",
+                    frame_count,
+                    total_frames,
+                    video_recorder.progress() * 100.0
+                );
+            }
+
+            // Check for game completion
+            if !game_won && self.game_controller.is_game_won() {
+                game_won = true;
+                log::info!(
+                    "[REC] Game won at frame {} ({:.1}s)",
+                    frame_count,
+                    frame_count as f64 / fps as f64
+                );
+            }
+
+            if game_won {
+                post_completion_frames += 1;
+                if post_completion_frames >= fps {
+                    // 1 second post-completion captured
+                    break;
+                }
+            }
+
+            // Safety: don't exceed maximum frames
+            if frame_count >= total_frames {
+                log::warn!(
+                    "[REC] Reached maximum frame count ({}) without game completion",
+                    total_frames
+                );
+                break;
+            }
+
+            frame_count += 1;
+        }
+
+        // Finalize video
+        match video_recorder.finish() {
+            Ok(elapsed) => {
+                log::info!(
+                    "[REC] Video saved to: {} ({} frames, {:.1}s real time)",
+                    output_path,
+                    video_recorder.frames_written(),
+                    elapsed
+                );
+            }
+            Err(e) => {
+                log::error!("[REC] Failed to finalize video: {}", e);
+            }
+        }
+    }
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    // Validate --output-video constraints
+    if cli.output_video.is_some() {
+        if !cli.autoplay {
+            eprintln!("Error: --output-video requires --autoplay to be enabled.");
+            std::process::exit(1);
+        }
+        match cli.gamemode {
+            Some(CliGameMode::OneRound) | None => {}
+            Some(CliGameMode::Endless) | Some(CliGameMode::Survival) => {
+                eprintln!("Error: --output-video requires --gamemode one_round.");
+                std::process::exit(1);
+            }
+        }
+        if cli.file.is_none() {
+            eprintln!("Error: --output-video requires --file <level.json>.");
+            std::process::exit(1);
+        }
+    }
 
     // Initialize logger
     let base_level = if cli.verbose { "debug" } else { "info" };
@@ -603,6 +904,12 @@ fn main() {
     }
     if cli.autoplay {
         log::info!("Autoplay enabled");
+    }
+    if cli.output_video.is_some() {
+        log::info!(
+            "Video recording enabled: {}",
+            cli.output_video.as_deref().unwrap_or("<unknown>")
+        );
     }
 
     // Log soundfont configuration (if feature enabled)

@@ -18,6 +18,8 @@ pub struct GameController {
     pub enable_autoplay: bool,
     start_time: Option<Instant>,
     last_update_time: Option<Instant>,
+    /// Accumulated virtual time in milliseconds. Used for deterministic recording.
+    accumulated_time_ms: f64,
 }
 
 impl GameController {
@@ -41,6 +43,7 @@ impl GameController {
             enable_autoplay,
             start_time: None,
             last_update_time: None,
+            accumulated_time_ms: 0.0,
         }
     }
     /// Load a level from a JSON file path.
@@ -124,6 +127,7 @@ impl GameController {
         self.audio_manager.reset_playback();
         self.start_time = None;
         self.last_update_time = None;
+        self.accumulated_time_ms = 0.0;
         self.is_paused = false;
     }
 
@@ -142,10 +146,11 @@ impl GameController {
         self.audio_manager.clear_midi_data();
         self.start_time = None;
         self.last_update_time = None;
+        self.accumulated_time_ms = 0.0;
         self.is_paused = false;
     }
 
-    /// Called each frame to advance game logic.
+    /// Called each frame to advance game logic using real-time delta.
     pub fn update(&mut self) {
         let now = Instant::now();
         if self.start_time.is_none() {
@@ -159,6 +164,26 @@ impl GameController {
         };
         self.last_update_time = Some(now);
 
+        self.run_update_logic(dt, current_time);
+    }
+
+    /// Called each frame to advance game logic using a fixed deterministic timestep.
+    /// Used for video recording where frames must be reproducible.
+    pub fn update_with_dt(&mut self, forced_dt: f64) {
+        let now = Instant::now();
+        if self.start_time.is_none() {
+            self.start_time = Some(now);
+        }
+
+        // Accumulate virtual time deterministically
+        let current_time = self.accumulated_time_ms;
+        self.accumulated_time_ms += forced_dt * 1000.0;
+
+        self.run_update_logic(forced_dt, current_time);
+    }
+
+    /// Shared update logic used by both real-time and deterministic updates.
+    fn run_update_logic(&mut self, dt: f64, current_time: f64) {
         if self.is_paused {
             return;
         }
@@ -293,6 +318,40 @@ impl GameController {
         match self.start_time {
             Some(start) => Instant::now().duration_since(start).as_secs_f64() * 1000.0,
             None => 0.0,
+        }
+    }
+
+    /// Get the accumulated virtual time in milliseconds (used during recording).
+    pub fn get_accumulated_time_ms(&self) -> f64 {
+        self.accumulated_time_ms
+    }
+
+    /// Simulate clicking the START tile to begin the game.
+    /// Used during video recording to programmatically start the game.
+    pub fn click_start_tile(&mut self) {
+        let active_idx = self.game_data.active_row_index;
+        if active_idx >= self.game_data.rows.len() {
+            return;
+        }
+        let row = &self.game_data.rows[active_idx];
+        if row.row_type != RowType::StartingTileRow {
+            return;
+        }
+        if let Some(tile) = row.tiles.first() {
+            let lane = tile.lane_index;
+            let current_time = self.accumulated_time_ms;
+            game_state::handle_tile_press(
+                &mut self.game_data,
+                lane,
+                None,
+                InputType::Keyboard,
+                current_time,
+                &mut self.audio_manager,
+                &mut self.score_manager,
+                self.enable_autoplay,
+            );
+            self.is_paused = false;
+            log::info!("[REC] START tile clicked at {:.1}ms", current_time);
         }
     }
 

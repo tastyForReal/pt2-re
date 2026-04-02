@@ -178,7 +178,8 @@ impl SpriteRenderer {
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Sprite Uniforms"),
-            size: 8,
+            // Padded to 16 bytes for GL ES 3.0 compatibility
+            size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -271,7 +272,8 @@ impl SpriteRenderer {
 
     pub fn update_uniforms(&self, queue: &wgpu::Queue, width: f32, height: f32) {
         if let Some(ref ub) = self.uniform_buffer {
-            queue.write_buffer(ub, 0, bytemuck::bytes_of(&[width, height]));
+            let padded: [f32; 4] = [width, height, 0.0, 0.0];
+            queue.write_buffer(ub, 0, bytemuck::bytes_of(&padded));
         }
     }
 

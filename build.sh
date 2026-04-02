@@ -91,6 +91,16 @@ if ! ldconfig -p 2>/dev/null | grep -q "libasound.so "; then
 fi
 
 # =============================================================================
+# Check for FFmpeg (needed for --output-video)
+# =============================================================================
+echo "==> Checking for FFmpeg..."
+if ! command -v ffmpeg &>/dev/null; then
+    echo "WARNING: ffmpeg not found in PATH. The --output-video feature will not work."
+else
+    echo "    ffmpeg found: $(ffmpeg -version 2>/dev/null | head -1)"
+fi
+
+# =============================================================================
 # Build
 # =============================================================================
 echo "==> Building pt2-re (soundfont feature)..."

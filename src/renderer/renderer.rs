@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::bitmap_font_renderer::BitmapFontRenderer;
-use super::gpu_context::GpuContext;
+use super::gpu_context::{GpuContext, OffscreenTarget};
 use super::score_renderer::ScoreRenderer;
 use super::sprite_renderer::{RenderSpriteOptions, SpriteRenderer};
 use super::tile_renderer::{TileRenderer, TileVertex, push_rect};
@@ -72,26 +72,85 @@ impl Renderer {
         now: f64,
         show_red_note_indicators: bool,
     ) -> Result<(), wgpu::SurfaceError> {
-        let output = gpu.surface.get_current_texture()?;
+        let surface = gpu.surface.as_ref().ok_or(wgpu::SurfaceError::Lost)?;
+        let config = gpu.config.as_ref().ok_or(wgpu::SurfaceError::Lost)?;
+
+        let output = surface.get_current_texture()?;
         let view = output.texture.create_view(&Default::default());
 
-        let actual_w = gpu.config.width as f32;
-        let actual_h = gpu.config.height as f32;
+        let actual_w = config.width as f32;
+        let actual_h = config.height as f32;
+
+        self.render_to_view(
+            &gpu.device,
+            &gpu.queue,
+            &view,
+            actual_w,
+            actual_h,
+            game_data,
+            score_data,
+            now,
+            show_red_note_indicators,
+        );
+
+        output.present();
+        Ok(())
+    }
+
+    /// Render a frame to an offscreen target and return the raw BGRA pixel data.
+    pub fn render_frame_to_bytes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        offscreen: &OffscreenTarget,
+        game_data: &GameData,
+        score_data: &ScoreData,
+        now: f64,
+    ) -> Vec<u8> {
+        let actual_w = offscreen.texture.width() as f32;
+        let actual_h = offscreen.texture.height() as f32;
+
+        self.render_to_view(
+            device,
+            queue,
+            &offscreen.view,
+            actual_w,
+            actual_h,
+            game_data,
+            score_data,
+            now,
+            false,
+        );
+
+        offscreen.read_pixels(device, queue)
+    }
+
+    /// Core rendering logic shared by both surface and offscreen rendering.
+    fn render_to_view(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        actual_w: f32,
+        actual_h: f32,
+        game_data: &GameData,
+        score_data: &ScoreData,
+        now: f64,
+        show_red_note_indicators: bool,
+    ) {
         let scale_h = actual_h / SCREEN_HEIGHT;
         let scale_w = actual_w / SCREEN_WIDTH;
 
         self.tile_renderer
-            .update_uniforms(&gpu.queue, actual_w, actual_h);
+            .update_uniforms(queue, actual_w, actual_h);
         self.sprite_renderer
-            .update_uniforms(&gpu.queue, actual_w, actual_h);
+            .update_uniforms(queue, actual_w, actual_h);
         self.font_renderer
-            .update_uniforms(&gpu.queue, actual_w, actual_h);
+            .update_uniforms(queue, actual_w, actual_h);
 
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Frame Encoder"),
-            });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Frame Encoder"),
+        });
 
         let mut all_vertices: Vec<TileVertex> = Vec::new();
 
@@ -269,7 +328,7 @@ impl Renderer {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -287,19 +346,19 @@ impl Renderer {
 
             // Draw layer 1
             self.tile_renderer.draw(
-                &gpu.device,
+                device,
                 &mut render_pass,
                 &all_vertices[..layer1_vertex_count],
             );
 
             // Draw Sprites
             if self.sprite_renderer.is_loaded() {
-                self.sprite_renderer.draw(&gpu.device, &mut render_pass);
+                self.sprite_renderer.draw(device, &mut render_pass);
             }
 
             // Draw layer 2
             self.tile_renderer.draw(
-                &gpu.device,
+                device,
                 &mut render_pass,
                 &all_vertices[layer1_vertex_count..],
             );
@@ -327,8 +386,8 @@ impl Renderer {
                     ty,
                     font_scale,
                     [1.0, 1.0, 1.0, opacity],
-                    0.0, // scroll offset already handled in ty calculation if needed, but START tile is fixed
-                    &gpu.device,
+                    0.0,
+                    device,
                     &mut render_pass,
                     0.5,
                     0.5,
@@ -340,7 +399,7 @@ impl Renderer {
                     &self.font_renderer,
                     score_data,
                     game_data.scroll_offset,
-                    &gpu.device,
+                    device,
                     &mut render_pass,
                     actual_w,
                     actual_h,
@@ -349,13 +408,10 @@ impl Renderer {
                 );
             }
 
-            self.render_status_text(game_data, &gpu.device, &mut render_pass);
+            self.render_status_text(game_data, device, &mut render_pass);
         }
 
-        gpu.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
+        queue.submit(std::iter::once(encoder.finish()));
     }
 
     fn render_long_tile(

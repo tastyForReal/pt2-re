@@ -130,6 +130,8 @@ pub struct AudioManager {
     track_pointers: Vec<usize>,
     played_notes: HashSet<i64>,
     active_notes: Vec<ActiveNote>,
+    /// When true, all audio output is suppressed (used during video recording).
+    muted: bool,
 
     #[cfg(feature = "audio")]
     _stream: Option<OutputStream>,
@@ -216,6 +218,7 @@ impl AudioManager {
             track_pointers: Vec::new(),
             played_notes: HashSet::new(),
             active_notes: Vec::new(),
+            muted: false,
 
             #[cfg(feature = "audio")]
             _stream: stream,
@@ -639,12 +642,38 @@ impl AudioManager {
         }
     }
 
+    /// Mute or unmute all audio output.
+    /// When muted, `play_sample`, `play_note_by_midi`, `update_midi_playback`,
+    /// and other output methods become no-ops.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        if muted {
+            log::info!("Audio output muted");
+            // Stop any currently playing samples immediately
+            self.stop_all_samples();
+            #[cfg(feature = "soundfont")]
+            if let Some(ref synth) = self.soundfont_synth {
+                synth.all_notes_off();
+            }
+        } else {
+            log::info!("Audio output unmuted");
+        }
+    }
+
+    /// Returns whether audio output is currently muted.
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
     pub fn update_midi_playback(
         &mut self,
         current_time: f64,
         _skipped_note_ids: &[i64],
         speed_multiplier: f64,
     ) -> Vec<i64> {
+        if self.muted {
+            return Vec::new();
+        }
         let midi_data = match &self.midi_data {
             Some(m) => m,
             None => return Vec::new(),
@@ -748,6 +777,9 @@ impl AudioManager {
     }
 
     pub fn play_note_by_midi(&self, midi_number: u8) {
+        if self.muted {
+            return;
+        }
         #[cfg(feature = "soundfont")]
         {
             // Check if soundfont is available and enabled
@@ -774,6 +806,9 @@ impl AudioManager {
     /// This is primarily important for soundfont synthesis, which sustains notes
     /// until explicitly released, allowing the release envelope to play.
     pub fn play_note_off_by_midi(&self, midi_number: u8) {
+        if self.muted {
+            return;
+        }
         #[cfg(feature = "soundfont")]
         {
             if self.using_soundfont
@@ -805,6 +840,9 @@ impl AudioManager {
     }
 
     pub fn play_sample(&self, filename: &str) {
+        if self.muted {
+            return;
+        }
         #[cfg(feature = "audio")]
         {
             if let Some(controller) = &self.mixer_controller {
@@ -891,6 +929,9 @@ impl AudioManager {
     }
 
     pub fn play_random_sample(&self) {
+        if self.muted {
+            return;
+        }
         #[cfg(feature = "audio")]
         {
             if self.midi_data.is_some() {
@@ -914,6 +955,9 @@ impl AudioManager {
     }
 
     pub fn play_game_over_chord(&self) {
+        if self.muted {
+            return;
+        }
         self.play_sample("c.mp3");
         self.play_sample("e.mp3");
         self.play_sample("g.mp3");

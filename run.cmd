@@ -1,1 +1,1 @@
-cargo run --features "audio,soundfont" -- --autoplay --gamemode one-round --preload-samples --file "C:\a\tests\midi_export.json"
+cargo run --features "audio" -- --autoplay --gamemode one-round --headless --output-video "C:\projects\dev\pt2-re\a.mp4" --file "C:\PianoTiles2\com.kooapps.pianotiles2gp-m6PUH7qoBzQx1ytaVKOzHw==\base\assets\data\songs\Little Star.json"
