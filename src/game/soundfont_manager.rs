@@ -123,7 +123,7 @@ impl Default for SoundfontConfig {
             path: "assets/sounds/sf2/piano.sf2".to_string(),
             sample_rate: 44100,
             voices: 256,
-            volume: 0.25,
+            volume: 0.5,
             channel: 0,
         }
     }
