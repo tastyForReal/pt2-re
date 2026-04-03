@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # pt2-re build script
-# Builds the project with the "soundfont" feature enabled.
+# Builds the project with the "audio,soundfont" feature enabled.
 # Requires: curl, a C compiler (cc), make, and internet access.
 # =============================================================================
 
@@ -103,13 +103,13 @@ fi
 # =============================================================================
 # Build
 # =============================================================================
-echo "==> Building pt2-re (soundfont feature)..."
-cargo build --features "soundfont"
+echo "==> Building pt2-re..."
+cargo build --features "audio,soundfont"
 
 echo "==> Running cargo fmt"
 cargo fmt
 
-echo "==> Running cargo clippy --features \"soundfont\" -- -D \"warnings\""
-cargo clippy --features "soundfont" -- -D "warnings"
+echo "==> Running cargo clippy with warnings as errors"
+cargo clippy --features "audio,soundfont" -- -D "warnings"
 
 echo "==> Build complete."
