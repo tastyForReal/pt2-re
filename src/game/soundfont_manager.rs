@@ -1,8 +1,8 @@
 //! Soundfont synthesis management module.
 //!
 //! This module provides safe Rust bindings to TinySoundFont for software synthesizer
-//! playback using SoundFont (.sf2) files. It integrates with the existing rodio
-//! audio pipeline via the DynamicMixer architecture.
+//! playback using SoundFont (.sf2) files. It integrates with the audio pipeline
+//! via the miniaudio data callback architecture.
 //!
 //! # Features
 //! - Lazy loading of soundfont files
@@ -10,6 +10,7 @@
 //! - Configurable polyphony
 //! - Thread-safe access from game loop
 //! - Automatic fallback support
+//! - Audio rendering for integration with audio callbacks
 //!
 //! # Example
 //! ```ignore
@@ -160,9 +161,10 @@ impl SoundfontConfig {
 /// Core soundfont synthesizer trait.
 ///
 /// This trait defines the interface for soundfont synthesis operations.
-/// Only Send is required (not Sync) since we manage internal synchronization
-/// via Arc<Mutex<...>> in the TinySFSynth implementation.
-pub trait SoundfontSynth: Send {
+/// Both `Send` and `Sync` are required so that implementors can be shared
+/// via `Arc` between the main thread (game loop) and the audio callback
+/// thread.
+pub trait SoundfontSynth: Send + Sync {
     /// Play a MIDI note with specified velocity
     ///
     /// # Arguments
@@ -192,6 +194,16 @@ pub trait SoundfontSynth: Send {
 
     /// Reset the synthesizer to initial state
     fn reset(&self);
+
+    /// Render audio into the given buffer.
+    ///
+    /// `buffer` is interpreted as interleaved stereo f32 samples (`[L, R, L, R, ...]`).
+    /// `frames` is the number of stereo frames to render (so `buffer.len()` should be
+    /// at least `frames * 2`).
+    ///
+    /// The default implementation is a no-op; synthesizer implementations that produce
+    /// audio output should override this.
+    fn render_audio(&self, _buffer: &mut [f32], _frames: usize) {}
 }
 
 // =============================================================================
@@ -201,19 +213,64 @@ pub trait SoundfontSynth: Send {
 /// Shared handle to a TinySoundFont synthesizer, wrapped for thread-safe access.
 /// The inner `Option<*mut tsf>` is Some when a soundfont is loaded, None after unload.
 #[cfg(feature = "soundfont")]
-pub type SharedTsfHandle = std::sync::Arc<std::sync::Mutex<Option<*mut crate::tsf_bindings::tsf>>>;
+pub type SharedTsfHandle = std::sync::Arc<std::sync::Mutex<SendSyncTsfHandle>>;
+
+/// Thread-safe wrapper for a raw TinySoundFont pointer.
+///
+/// This wrapper implements `Send` and `Sync`, enabling it to be used inside
+/// `Arc<Mutex<...>>` without triggering clippy's `arc_with_non_send_sync` lint.
+///
+/// # Safety
+/// The raw pointer is safe to send/share across threads because:
+/// - All access is serialized through a `std::sync::Mutex`
+/// - The TinySoundFont C API is safe to call from any thread when externally synchronized
+/// - Ownership of the handle is exclusively managed by Rust code
+#[cfg(feature = "soundfont")]
+pub struct SendSyncTsfHandle(Option<*mut crate::tsf_bindings::tsf>);
+
+#[cfg(feature = "soundfont")]
+unsafe impl Send for SendSyncTsfHandle {}
+
+#[cfg(feature = "soundfont")]
+unsafe impl Sync for SendSyncTsfHandle {}
+
+#[cfg(feature = "soundfont")]
+impl SendSyncTsfHandle {
+    /// Create a new handle wrapper.
+    pub fn new(ptr: Option<*mut crate::tsf_bindings::tsf>) -> Self {
+        Self(ptr)
+    }
+
+    /// Get the raw pointer.
+    pub fn as_ptr(&self) -> Option<*mut crate::tsf_bindings::tsf> {
+        self.0
+    }
+
+    /// Take the raw pointer, leaving None in its place.
+    pub fn take(&mut self) -> Option<*mut crate::tsf_bindings::tsf> {
+        self.0.take()
+    }
+
+    /// Set the raw pointer.
+    pub fn set(&mut self, ptr: Option<*mut crate::tsf_bindings::tsf>) {
+        self.0 = ptr;
+    }
+
+    /// Check if the pointer is Some.
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+}
 
 #[cfg(feature = "soundfont")]
 mod tsf_impl {
     use super::*;
     use crate::tsf_bindings::{
-        self, TSFOutputMode, tsf, tsf_channel_note_off, tsf_channel_note_on,
+        self, TSFOutputMode, tsf_channel_note_off, tsf_channel_note_on,
         tsf_channel_set_presetnumber, tsf_close, tsf_note_off_all, tsf_render_float, tsf_reset,
         tsf_set_max_voices, tsf_set_output, tsf_set_volume,
     };
-    use rodio::Source;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::time::Duration;
 
     /// TinySoundFont-based synthesizer implementation.
     ///
@@ -222,11 +279,11 @@ mod tsf_impl {
     /// processing.
     ///
     /// The opaque `*mut tsf` handle is wrapped in a std::sync::Mutex to provide
-    /// thread-safe access while maintaining the Send requirement for the
+    /// thread-safe access while maintaining the Send + Sync requirements for the
     /// SoundfontSynth trait.
     pub struct TinySFSynth {
         /// TinySoundFont synthesizer handle (nullable, owned)
-        synth: std::sync::Mutex<Option<*mut tsf>>,
+        synth: std::sync::Mutex<super::SendSyncTsfHandle>,
 
         /// Configuration
         config: std::sync::Mutex<SoundfontConfig>,
@@ -276,17 +333,19 @@ mod tsf_impl {
         }
     }
 
-    // Safety: TinySFSynth uses Mutex for interior mutability and the tsf handle
-    // is only accessed through the mutex. The tsf handle itself is Send because
-    // it's a raw pointer to a C struct that we manage exclusively.
+    // Safety: TinySFSynth uses Mutex for interior mutability and all fields
+    // (Mutex, AtomicU32, AtomicBool, u32) are Send + Sync. The tsf handle
+    // is only accessed through the mutex and is wrapped in SendSyncTsfHandle
+    // which is also Send + Sync.
     unsafe impl Send for TinySFSynth {}
+    unsafe impl Sync for TinySFSynth {}
 
     impl TinySFSynth {
         /// Create a new TinySoundFont synthesizer instance.
         /// The synthesizer is initially empty; call `load_soundfont()` to load a .sf2 file.
         pub fn new() -> SoundfontResult<Self> {
             Ok(Self {
-                synth: std::sync::Mutex::new(None),
+                synth: std::sync::Mutex::new(super::SendSyncTsfHandle::new(None)),
                 config: std::sync::Mutex::new(SoundfontConfig::default()),
                 state: AtomicU32::new(STATE_UNINITIALIZED),
                 loaded: AtomicBool::new(false),
@@ -410,7 +469,7 @@ mod tsf_impl {
             // Store the handle
             {
                 let mut synth_guard = self.synth.lock().unwrap();
-                *synth_guard = Some(tsf_handle);
+                synth_guard.set(Some(tsf_handle));
             }
 
             // Store configuration
@@ -428,9 +487,9 @@ mod tsf_impl {
             Ok(())
         }
 
-        /// Get the raw tsf handle for integration with rodio.
+        /// Get the raw tsf handle for integration.
         /// Returns a MutexGuard wrapping the optional raw pointer.
-        pub fn get_synth(&self) -> std::sync::MutexGuard<'_, Option<*mut tsf>> {
+        pub fn get_synth(&self) -> std::sync::MutexGuard<'_, super::SendSyncTsfHandle> {
             self.synth.lock().unwrap()
         }
 
@@ -439,7 +498,7 @@ mod tsf_impl {
         /// `frames` is the number of stereo frames to render.
         pub fn process(&self, buffer: &mut [f32], frames: usize) {
             let synth_guard = self.synth.lock().unwrap();
-            if let Some(handle) = *synth_guard {
+            if let Some(handle) = synth_guard.as_ptr() {
                 let stereo_frames = frames.min(buffer.len() / 2);
                 unsafe {
                     tsf_render_float(
@@ -478,7 +537,7 @@ mod tsf_impl {
         fn note_on(&self, channel: u8, note: u8, velocity: u8) {
             if self.loaded.load(Ordering::SeqCst) {
                 let synth_guard = self.synth.lock().unwrap();
-                if let Some(handle) = *synth_guard {
+                if let Some(handle) = synth_guard.as_ptr() {
                     // Convert velocity from 0-127 to 0.0-1.0 float range
                     let vel_float = velocity as f32 / 127.0;
                     let result = unsafe {
@@ -500,7 +559,7 @@ mod tsf_impl {
         fn note_off(&self, channel: u8, note: u8) {
             if self.loaded.load(Ordering::SeqCst) {
                 let synth_guard = self.synth.lock().unwrap();
-                if let Some(handle) = *synth_guard {
+                if let Some(handle) = synth_guard.as_ptr() {
                     unsafe {
                         tsf_channel_note_off(
                             handle,
@@ -516,7 +575,7 @@ mod tsf_impl {
 
         fn all_notes_off(&self) {
             let synth_guard = self.synth.lock().unwrap();
-            if let Some(handle) = *synth_guard {
+            if let Some(handle) = synth_guard.as_ptr() {
                 unsafe {
                     tsf_note_off_all(handle);
                 }
@@ -539,7 +598,7 @@ mod tsf_impl {
 
         fn reset(&self) {
             let synth_guard = self.synth.lock().unwrap();
-            if let Some(handle) = *synth_guard {
+            if let Some(handle) = synth_guard.as_ptr() {
                 unsafe {
                     tsf_reset(handle);
                 }
@@ -547,24 +606,24 @@ mod tsf_impl {
                 log::debug!("Synthesizer reset");
             }
         }
+
+        fn render_audio(&self, buffer: &mut [f32], frames: usize) {
+            self.process(buffer, frames);
+        }
     }
 
-    /// Rodio Source wrapper for TinySFSynth.
+    /// Soundfont synthesizer data holder.
     ///
-    /// This struct wraps a TinySFSynth and implements rodio's Source trait
-    /// so it can be mixed with other audio sources in the rodio pipeline.
+    /// This struct wraps a shared tsf handle and can be used to create multiple
+    /// `ArcSoundfontSynth` instances that share the same underlying synthesizer.
+    /// Previously this implemented `rodio::Source`; it is now a simple data holder.
     pub struct SoundfontSource {
         /// The synthesizer handle (raw pointer, shared ownership via Arc)
-        synth: Arc<std::sync::Mutex<Option<*mut tsf>>>,
-        /// Buffer for generating interleaved stereo samples
-        buffer: Vec<f32>,
-        /// Current position in the buffer
-        pos: usize,
-        /// Number of frames to generate per buffer refill
-        frames_per_fill: usize,
+        synth: Arc<std::sync::Mutex<super::SendSyncTsfHandle>>,
         /// Sample rate
         sample_rate: u32,
         /// Number of channels (always 2 for stereo)
+        #[allow(dead_code)]
         channels: u16,
     }
 
@@ -577,17 +636,12 @@ mod tsf_impl {
         /// This takes the inner tsf handle from the TinySFSynth.
         pub fn from_tinysf(synth: TinySFSynth) -> Self {
             let sample_rate = synth.sample_rate;
-            let frames_per_fill = 512;
-            let buffer_size = frames_per_fill * 2; // stereo
 
             // Take the inner tsf handle from TinySFSynth
             let inner_handle = synth.synth.lock().unwrap().take();
 
             Self {
-                synth: Arc::new(std::sync::Mutex::new(inner_handle)),
-                buffer: vec![0.0; buffer_size],
-                pos: buffer_size, // Start with empty buffer to trigger refill
-                frames_per_fill,
+                synth: Arc::new(std::sync::Mutex::new(super::SendSyncTsfHandle::new(inner_handle))),
                 sample_rate,
                 channels: 2,
             }
@@ -604,48 +658,24 @@ mod tsf_impl {
         /// Create a new SoundfontSource from a shared synth Arc and sample rate.
         /// This is used to recreate the source after a mixer rebuild.
         pub fn from_synth_arc(
-            synth: Arc<std::sync::Mutex<Option<*mut tsf>>>,
+            synth: Arc<std::sync::Mutex<super::SendSyncTsfHandle>>,
             sample_rate: u32,
         ) -> Self {
-            let frames_per_fill = 512;
-            let buffer_size = frames_per_fill * 2; // stereo
             Self {
                 synth,
-                buffer: vec![0.0; buffer_size],
-                pos: buffer_size, // Start with empty buffer to trigger refill
-                frames_per_fill,
                 sample_rate,
                 channels: 2,
             }
         }
 
-        fn refill_buffer(&mut self) {
-            let guard = self.synth.lock().unwrap();
-            if let Some(handle) = *guard {
-                let stereo_frames = self.frames_per_fill;
-                self.buffer.resize(stereo_frames * 2, 0.0);
-
-                unsafe {
-                    tsf_render_float(
-                        handle,
-                        self.buffer.as_mut_ptr(),
-                        stereo_frames as std::os::raw::c_int,
-                        0, // flag_mixing: 0 = clear buffer first
-                    );
-                }
-                self.pos = 0;
-            }
-            drop(guard);
-        }
-
-        pub fn into_synth(mut self) -> Arc<std::sync::Mutex<Option<*mut tsf>>> {
+        pub fn into_synth(mut self) -> Arc<std::sync::Mutex<super::SendSyncTsfHandle>> {
             let synth_arc = self.synth.clone();
-            self.synth = Arc::new(std::sync::Mutex::new(None));
+            self.synth = Arc::new(std::sync::Mutex::new(super::SendSyncTsfHandle::new(None)));
             synth_arc
         }
 
         /// Clone the inner synth Arc without consuming self.
-        pub fn clone_synth_arc(&self) -> Arc<std::sync::Mutex<Option<*mut tsf>>> {
+        pub fn clone_synth_arc(&self) -> Arc<std::sync::Mutex<super::SendSyncTsfHandle>> {
             self.synth.clone()
         }
 
@@ -654,66 +684,18 @@ mod tsf_impl {
         }
     }
 
-    impl Iterator for SoundfontSource {
-        type Item = f32;
-
-        #[inline]
-        fn next(&mut self) -> Option<Self::Item> {
-            // Refill buffer if empty
-            if self.pos >= self.buffer.len() {
-                self.refill_buffer();
-            }
-
-            if self.pos < self.buffer.len() {
-                let sample = self.buffer[self.pos];
-                self.pos += 1;
-                Some(sample)
-            } else {
-                None
-            }
-        }
-
-        #[inline]
-        fn size_hint(&self) -> (usize, Option<usize>) {
-            // Return infinite to keep the source playing
-            (usize::MAX, None)
-        }
-    }
-
-    impl Source for SoundfontSource {
-        #[inline]
-        fn current_frame_len(&self) -> Option<usize> {
-            None // Infinite source
-        }
-
-        #[inline]
-        fn channels(&self) -> u16 {
-            self.channels
-        }
-
-        #[inline]
-        fn sample_rate(&self) -> u32 {
-            self.sample_rate
-        }
-
-        #[inline]
-        fn total_duration(&self) -> Option<Duration> {
-            None // Infinite duration
-        }
-    }
-
     /// Extract the inner synthesizer Arc from a SoundfontSource.
     /// After calling this, the SoundfontSource is no longer usable for audio output.
     #[allow(dead_code)]
-    pub fn into_synth_global(synth: SoundfontSource) -> Arc<std::sync::Mutex<Option<*mut tsf>>> {
+    pub fn into_synth_global(synth: SoundfontSource) -> Arc<std::sync::Mutex<super::SendSyncTsfHandle>> {
         synth.synth.clone()
     }
 
     /// A wrapper that implements SoundfontSynth by holding an Arc to the raw tsf handle.
-    /// This allows the trait object to be stored in AudioManager while the SoundfontSource
-    /// (which feeds audio into the rodio mixer) holds its own Arc clone.
+    /// This allows the trait object to be stored in AudioManager while the audio
+    /// callback holds its own Arc clone for rendering.
     pub struct ArcSoundfontSynth {
-        synth: Arc<std::sync::Mutex<Option<*mut tsf>>>,
+        synth: Arc<std::sync::Mutex<super::SendSyncTsfHandle>>,
         loaded: AtomicBool,
     }
 
@@ -721,7 +703,7 @@ mod tsf_impl {
     unsafe impl Sync for ArcSoundfontSynth {}
 
     impl ArcSoundfontSynth {
-        pub fn new(synth: Arc<std::sync::Mutex<Option<*mut tsf>>>) -> Self {
+        pub fn new(synth: Arc<std::sync::Mutex<super::SendSyncTsfHandle>>) -> Self {
             let loaded = synth.lock().ok().is_some_and(|g| g.is_some());
             Self {
                 synth,
@@ -733,7 +715,7 @@ mod tsf_impl {
     impl SoundfontSynth for ArcSoundfontSynth {
         fn note_on(&self, channel: u8, note: u8, velocity: u8) {
             if let Ok(guard) = self.synth.lock()
-                && let Some(handle) = *guard
+                && let Some(handle) = guard.as_ptr()
             {
                 let vel_float = velocity as f32 / 127.0;
                 unsafe {
@@ -749,7 +731,7 @@ mod tsf_impl {
 
         fn note_off(&self, channel: u8, note: u8) {
             if let Ok(guard) = self.synth.lock()
-                && let Some(handle) = *guard
+                && let Some(handle) = guard.as_ptr()
             {
                 unsafe {
                     tsf_channel_note_off(
@@ -763,7 +745,7 @@ mod tsf_impl {
 
         fn all_notes_off(&self) {
             if let Ok(guard) = self.synth.lock()
-                && let Some(handle) = *guard
+                && let Some(handle) = guard.as_ptr()
             {
                 unsafe {
                     tsf_note_off_all(handle);
@@ -789,6 +771,25 @@ mod tsf_impl {
 
         fn reset(&self) {
             self.all_notes_off();
+        }
+
+        fn render_audio(&self, buffer: &mut [f32], frames: usize) {
+            if let Ok(guard) = self.synth.lock()
+                && let Some(handle) = guard.as_ptr()
+            {
+                let stereo_frames = frames.min(buffer.len() / 2);
+                // SAFETY: `handle` is a valid pointer to a tsf instance that was
+                // successfully initialized via tsf_load_memory. All access is
+                // serialized through the Mutex guard.
+                unsafe {
+                    tsf_render_float(
+                        handle,
+                        buffer.as_mut_ptr(),
+                        stereo_frames as std::os::raw::c_int,
+                        0, // flag_mixing: 0 = clear buffer first
+                    );
+                }
+            }
         }
     }
 } // end mod tsf_impl

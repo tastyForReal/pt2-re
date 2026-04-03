@@ -9,6 +9,12 @@ use winit::{
     window::{Window, WindowId},
 };
 
+// Import Windows-specific trait to access .with_drag_and_drop() on WindowAttributes.
+// This is needed to disable drag-and-drop, preventing winit from calling OleInitialize()
+// which conflicts with miniaudio's WASAPI backend CoInitializeEx() on the same thread.
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowAttributesExtWindows;
+
 use pt2::game::game_controller::GameController;
 use pt2::game::json_level_reader;
 use pt2::game::types::*;
@@ -204,6 +210,56 @@ impl App {
         }
     }
 
+    /// Run in pure headless mode (no display server, no GPU, no window).
+    /// Initializes audio subsystem and optionally loads a level, then exits.
+    /// Returns Ok(()) on success, Err(message) on failure.
+    fn run_headless_only(&mut self) -> Result<(), String> {
+        log::info!("[HEADLESS] Pure headless mode — no display server needed.");
+
+        // Initialize audio samples
+        self.game_controller
+            .audio_manager
+            .initialize_samples(&self.assets_dir, self.cli.preload_samples);
+        log::info!("[HEADLESS] Audio samples initialized.");
+
+        // Initialize soundfont synthesis (soundfont feature only)
+        #[cfg(feature = "soundfont")]
+        {
+            if self.cli.soundfont_enabled {
+                let sf_path = self.soundfont_path.to_string_lossy();
+                match self
+                    .game_controller
+                    .audio_manager
+                    .load_soundfont(&sf_path, self.cli.soundfont_fallback)
+                {
+                    Ok(()) => {
+                        log::info!("[HEADLESS] Soundfont loaded: {:?}", self.soundfont_path);
+                    }
+                    Err(e) => {
+                        log::warn!("[HEADLESS] Soundfont failed (non-fatal): {}", e);
+                    }
+                }
+            } else {
+                log::info!("[HEADLESS] Soundfont synthesis disabled via CLI flag.");
+            }
+        }
+
+        // Load level from CLI if provided
+        if let Some(ref file_path) = self.cli.file {
+            let path_owned = file_path.clone();
+            match self.load_level_with_gamemode(&path_owned) {
+                Ok(()) => log::info!("[HEADLESS] Loaded level: {}", path_owned),
+                Err(e) => {
+                    log::error!("[HEADLESS] Failed to load level: {}", e);
+                    return Err(format!("Failed to load level: {}", e));
+                }
+            }
+        }
+
+        log::info!("[HEADLESS] All subsystems initialized successfully. Exiting.");
+        Ok(())
+    }
+
     /// Initialize headless GPU context, renderer, audio, level, and run recording loop.
     /// Returns false if initialization failed.
     fn init_headless_recording(&mut self) -> bool {
@@ -297,6 +353,12 @@ impl ApplicationHandler for App {
             ))
             .with_resizable(true)
             .with_visible(false);
+        // Disable drag-and-drop to prevent winit from calling OleInitialize() on Windows.
+        // OleInitialize() needs COINIT_APARTMENTTHREADED, which conflicts with
+        // miniaudio's WASAPI backend calling CoInitializeEx(COINIT_MULTITHREADED)
+        // on the same thread.
+        #[cfg(target_os = "windows")]
+        let window_attributes = window_attributes.with_drag_and_drop(false);
 
         let window = Arc::new(
             event_loop
@@ -930,9 +992,62 @@ fn main() {
         log::info!("Soundfont: not compiled in (enable 'soundfont' feature)");
     }
 
-    let event_loop = EventLoop::new().expect("Failed to create event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // Detect whether a display server is available.
+    // On Windows/macOS, a display is always available (the OS has a native
+    // windowing system). On Linux/FreeBSD, we check for WAYLAND_DISPLAY,
+    // WAYLAND_SOCKET, or DISPLAY environment variables.
+    // If no display is found, we must use headless-only mode because
+    // winit's EventLoop::new() will panic without a display server.
+    let has_display = cfg!(target_os = "windows")
+        || cfg!(target_os = "macos")
+        || cfg!(target_os = "ios")
+        || std::env::var("WAYLAND_DISPLAY").is_ok()
+        || std::env::var("WAYLAND_SOCKET").is_ok()
+        || std::env::var("DISPLAY").is_ok();
+
+    // Determine if we should run in headless-only mode (no EventLoop).
+    // This is true when:
+    //   1. --headless is set without --output-video (explicit headless), OR
+    //   2. No display server is available and no video output is requested
+    let force_headless = !has_display && cli.output_video.is_none();
+    let use_headless_only = (cli.headless && cli.output_video.is_none()) || force_headless;
+
+    if use_headless_only {
+        if force_headless && !cli.headless {
+            log::warn!(
+                "No display server detected (no WAYLAND_DISPLAY/DISPLAY). \
+                 Falling back to headless-only mode."
+            );
+        }
+        // Set PT2_NO_AUDIO BEFORE App::new() to prevent miniaudio from
+        // blocking during ALSA/JACK probing in headless/CI environments.
+        unsafe {
+            std::env::set_var("PT2_NO_AUDIO", "1");
+        }
+    }
 
     let mut app = App::new(cli);
+
+    if use_headless_only {
+        match app.run_headless_only() {
+            Ok(()) => {}
+            Err(e) => {
+                log::error!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let event_loop = match EventLoop::new() {
+        Ok(el) => el,
+        Err(e) => {
+            log::error!("Failed to create event loop: {}. No display server available.", e);
+            log::info!("Tip: Run with --headless to skip the display entirely.");
+            std::process::exit(1);
+        }
+    };
+    event_loop.set_control_flow(ControlFlow::Poll);
+
     event_loop.run_app(&mut app).expect("Event loop error");
 }

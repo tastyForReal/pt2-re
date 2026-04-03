@@ -3,127 +3,366 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[cfg(feature = "audio")]
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Source};
-#[cfg(feature = "audio")]
-use std::sync::Arc;
-#[cfg(feature = "audio")]
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 // Soundfont imports - conditionally compiled
 #[cfg(feature = "soundfont")]
 use super::soundfont_manager::{
-    ArcSoundfontSynth, SharedTsfHandle, SoundfontConfig, SoundfontError, SoundfontResult,
-    SoundfontSource, SoundfontState, SoundfontSynth, TinySFSynth, validate_soundfont_path,
+    ArcSoundfontSynth, SendSyncTsfHandle, SoundfontConfig, SoundfontError, SoundfontResult,
+    SoundfontState, SoundfontSynth, TinySFSynth, validate_soundfont_path,
 };
 
+// =============================================================================
+// Audio backend types (feature-gated)
+// =============================================================================
+
 /// Internal representation of a pre-decoded audio sample.
+/// All samples are stored as interleaved stereo f32 at 44100 Hz.
 #[cfg(feature = "audio")]
 struct DecodedSample {
     data: Arc<[f32]>,
-    channels: u16,
-    sample_rate: u32,
 }
 
+/// A sample currently being played back, tracked by the audio callback.
 #[cfg(feature = "audio")]
-struct SharedSource {
+struct PlayingSample {
+    /// Interleaved stereo f32 sample data (44100 Hz).
     data: Arc<[f32]>,
-    channels: u16,
-    sample_rate: u32,
+    /// Current playback position in samples (not frames).
     pos: usize,
 }
 
+/// Shared state between the main thread and the miniaudio data callback.
+///
+/// All mutable fields are guarded by `std::sync::Mutex` so they can be
+/// safely accessed from both the audio thread (callback) and the main
+/// thread (game loop).
 #[cfg(feature = "audio")]
-impl Iterator for SharedSource {
-    type Item = f32;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos < self.data.len() {
-            let sample = self.data[self.pos];
-            self.pos += 1;
-            Some(sample)
-        } else {
-            None
+struct AudioCallbackData {
+    /// Queue of currently-playing samples, mixed in the audio callback.
+    playing: Mutex<Vec<PlayingSample>>,
+    /// Reusable scratch buffer for soundfont rendering.
+    synth_buffer: Mutex<Vec<f32>>,
+    /// The soundfont synthesizer, accessed from the callback for rendering.
+    #[cfg(feature = "soundfont")]
+    synth: Mutex<Option<Arc<dyn SoundfontSynth + Send + Sync>>>,
+}
+
+/// RAII wrapper around a `ma_device`. When dropped, the device is stopped
+/// (if running), then uninitialized. The `_callback_data` field keeps the
+/// shared callback state alive for the entire lifetime of the device.
+///
+/// On Windows, `ma_device_init()` for the WASAPI backend calls
+/// `CoInitializeEx(COINIT_MULTITHREADED)`, which conflicts with winit's
+/// `OleInitialize()` (which needs `COINIT_APARTMENTTHREADED`). Therefore,
+/// device initialization is deferred from `AudioManager::new()` to
+/// `initialize_samples()`, which runs inside winit's `resumed()` handler —
+/// after the window (and COM apartment) are already set up.
+#[cfg(feature = "audio")]
+struct AudioDevice {
+    device: crate::miniaudio_bindings::ma_device,
+    _callback_data: Arc<AudioCallbackData>,
+    started: bool,
+}
+
+#[cfg(feature = "audio")]
+impl AudioDevice {
+    /// Start the device if it hasn't been started yet.
+    /// Returns true if the device is now running, false if it failed to start.
+    fn ensure_started(&mut self) -> bool {
+        if self.started {
+            return true;
+        }
+        use crate::miniaudio_bindings::{
+            ma_device_start, ma_result_MA_SUCCESS,
+        };
+        // SAFETY: The device was previously initialized via ma_device_init.
+        unsafe {
+            let result = ma_device_start(&mut self.device);
+            if result == ma_result_MA_SUCCESS {
+                self.started = true;
+                log::info!("Miniaudio playback device started (lazy)");
+                true
+            } else {
+                log::error!("Failed to start miniaudio device (result={})", result);
+                false
+            }
+        }
+    }
+
+    /// Check whether the device has been successfully started.
+    fn is_started(&self) -> bool {
+        self.started
+    }
+}
+
+#[cfg(feature = "audio")]
+impl Drop for AudioDevice {
+    fn drop(&mut self) {
+        // SAFETY: The device was previously initialized via ma_device_init.
+        // If it was started, we stop it first. ma_device_stop blocks until
+        // the data callback has finished, so no callback is running when we
+        // call ma_device_uninit. The callback data Arc is still valid because
+        // _callback_data is only dropped after _device is uninitialized.
+        //
+        // We use std::panic::catch_unwind to guard against assertion failures
+        // in miniaudio during abnormal process teardown (e.g. when a panic in
+        // winit triggers unwinding while the audio device is in an unexpected
+        // state).
+        let stop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unsafe {
+                if self.started {
+                    crate::miniaudio_bindings::ma_device_stop(&mut self.device);
+                }
+                crate::miniaudio_bindings::ma_device_uninit(&mut self.device);
+            }
+        }));
+        if let Err(_) = stop_result {
+            log::warn!(
+                "AudioDevice::drop: caught panic during device cleanup \
+                 (this can happen during process teardown after an earlier error)"
+            );
         }
     }
 }
 
+// =============================================================================
+// Audio callback and helper functions
+// =============================================================================
+
+/// Decode an MP3 file to interleaved stereo f32 at 44100 Hz using miniaudio.
+///
+/// Returns `Some(Arc<[f32]>)` on success, `None` on failure.
 #[cfg(feature = "audio")]
-impl Source for SharedSource {
-    fn current_frame_len(&self) -> Option<usize> {
-        Some(self.data.len() - self.pos)
-    }
+fn decode_mp3_file(path: &std::path::Path) -> Option<Arc<[f32]>> {
+    use crate::miniaudio_bindings::{
+        ma_decoder, ma_decoder_config_init, ma_decoder_get_length_in_pcm_frames,
+        ma_decoder_init_file, ma_decoder_read_pcm_frames, ma_decoder_uninit,
+        ma_format_ma_format_f32, ma_result_MA_SUCCESS, ma_uint64,
+    };
 
-    fn channels(&self) -> u16 {
-        self.channels
-    }
+    let path_cstr = std::ffi::CString::new(path.to_str()?).ok()?;
 
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
+    // SAFETY: We provide valid pointers. ma_decoder is stack-allocated and
+    // will be fully initialized by ma_decoder_init_file on success.
+    unsafe {
+        let decoder_config = ma_decoder_config_init(ma_format_ma_format_f32, 2, 44100);
 
-    fn total_duration(&self) -> Option<Duration> {
-        let frames = self.data.len() / self.channels as usize;
-        Some(Duration::from_secs_f64(
-            frames as f64 / self.sample_rate as f64,
-        ))
+        let mut decoder = std::mem::MaybeUninit::<ma_decoder>::uninit();
+
+        let result = ma_decoder_init_file(
+            path_cstr.as_ptr(),
+            &decoder_config,
+            decoder.as_mut_ptr(),
+        );
+
+        if result != ma_result_MA_SUCCESS {
+            log::warn!("Failed to init ma_decoder for {:?}: {}", path, result);
+            return None;
+        }
+
+        let mut decoder = decoder.assume_init();
+
+        // Query the total number of frames in the file.
+        let mut total_frames: ma_uint64 = 0;
+        ma_decoder_get_length_in_pcm_frames(&mut decoder, &mut total_frames);
+
+        // For formats where the length is unknown, allocate a reasonable buffer.
+        let buffer_frames = if total_frames > 0 {
+            total_frames as usize
+        } else {
+            // Max 60 seconds of stereo audio as fallback.
+            44100 * 60
+        };
+
+        let mut buffer = vec![0.0f32; buffer_frames * 2];
+
+        let mut total_read: usize = 0;
+        loop {
+            let remaining = (buffer_frames - total_read) as ma_uint64;
+            let mut frames_read: ma_uint64 = 0;
+            let result = ma_decoder_read_pcm_frames(
+                &mut decoder,
+                buffer.as_mut_ptr().wrapping_add(total_read * 2) as *mut std::ffi::c_void,
+                remaining,
+                &mut frames_read,
+            );
+
+            if result != ma_result_MA_SUCCESS || frames_read == 0 {
+                break;
+            }
+            total_read += frames_read as usize;
+            if total_read >= buffer_frames {
+                break;
+            }
+        }
+
+        ma_decoder_uninit(&mut decoder);
+
+        if total_read == 0 {
+            log::warn!("No frames decoded from {:?}", path);
+            return None;
+        }
+
+        buffer.truncate(total_read * 2);
+        Some(Arc::from(buffer))
     }
 }
 
-/// Wrapper around DynamicMixer that never returns None.
-/// rodio's DynamicMixer returns None when there are no active sources,
-/// which causes the Sink to consider the source "finished" and stop polling.
-/// This wrapper returns silence (0.0) instead, keeping the Sink alive.
+/// The miniaudio data callback. Called from the audio thread for every
+/// device period to fill the output buffer.
+///
+/// # Safety
+///
+/// - `p_device` must point to a valid, initialized `ma_device` whose
+///   `pUserData` field points to an `AudioCallbackData` that is kept alive
+///   by an `AudioDevice` for the device's entire lifetime.
+/// - `p_output` must point to a buffer of at least `frame_count * 2 *
+///   size_of::<f32>()` bytes (interleaved stereo).
 #[cfg(feature = "audio")]
-struct InfiniteMixerSource {
-    inner: rodio::dynamic_mixer::DynamicMixer<f32>,
-    channels: u16,
-    sample_rate: u32,
+unsafe extern "C" fn audio_callback(
+    p_device: *mut crate::miniaudio_bindings::ma_device,
+    p_output: *mut std::ffi::c_void,
+    _p_input: *const std::ffi::c_void,
+    frame_count: crate::miniaudio_bindings::ma_uint32,
+) {
+    if p_output.is_null() || frame_count == 0 {
+        return;
+    }
+
+    // SAFETY: pUserData was set during device initialization to point to the
+    // AudioCallbackData. The AudioDevice struct holds an Arc to this data,
+    // ensuring it remains valid for the device's entire lifetime.
+    let data_ptr = unsafe { (*p_device).pUserData };
+    if data_ptr.is_null() {
+        return;
+    }
+    // SAFETY: data_ptr is valid for the device lifetime (see above).
+    let data = unsafe { &*(data_ptr as *const AudioCallbackData) };
+
+    let output = p_output as *mut f32;
+    let total_samples = frame_count as usize * 2; // stereo interleaved
+
+    // 1. Clear output buffer to silence.
+    // SAFETY: output is valid for frame_count * 2 f32 samples (guaranteed by miniaudio).
+    unsafe {
+        std::ptr::write_bytes(output, 0, total_samples);
+    }
+
+    // 2. Render soundfont audio and mix into output.
+    #[cfg(feature = "soundfont")]
+    {
+        let synth_guard = data.synth.lock().unwrap();
+        if let Some(ref synth) = *synth_guard {
+            let mut buffer = data.synth_buffer.lock().unwrap();
+            buffer.resize(total_samples, 0.0);
+            synth.render_audio(&mut buffer, frame_count as usize);
+            // Drop the synth lock before mixing to hold locks briefly.
+            drop(synth_guard);
+
+            // SAFETY: output is valid for frame_count * 2 f32 samples.
+            let output_slice = unsafe { std::slice::from_raw_parts_mut(output, total_samples) };
+            for i in 0..total_samples {
+                output_slice[i] += buffer[i];
+            }
+        }
+    }
+
+    // 3. Mix all currently playing samples (additive).
+    {
+        let mut playing = data.playing.lock().unwrap();
+        // SAFETY: output is valid for frame_count * 2 f32 samples.
+        let output_slice = unsafe { std::slice::from_raw_parts_mut(output, total_samples) };
+
+        for sample in playing.iter_mut() {
+            let remaining = &sample.data[sample.pos..];
+            let to_mix = remaining.len().min(total_samples);
+            for i in 0..to_mix {
+                output_slice[i] += remaining[i];
+            }
+            sample.pos += to_mix;
+        }
+
+        // Remove finished samples.
+        playing.retain(|s| s.pos < s.data.len());
+    }
 }
 
+/// Initialize a miniaudio playback device with our data callback.
+///
+/// The device is initialized but NOT started. The caller should call
+/// `AudioDevice::ensure_started()` before playing any audio.
+///
+/// Returns `Some(AudioDevice)` on success, `None` if the device could not
+/// be opened or if `PT2_NO_AUDIO` environment variable is set (useful for
+/// headless/CI environments where no audio hardware is available and ALSA
+/// probing would otherwise block indefinitely).
 #[cfg(feature = "audio")]
-impl Iterator for InfiniteMixerSource {
-    type Item = f32;
-
-    #[inline]
-    fn next(&mut self) -> Option<f32> {
-        // Always return Some — produce silence when the inner mixer has no sources
-        Some(self.inner.next().unwrap_or(0.0))
+fn init_audio_device(callback_data: Arc<AudioCallbackData>) -> Option<AudioDevice> {
+    // Skip device initialization in headless/CI environments.
+    if std::env::var("PT2_NO_AUDIO").is_ok() {
+        log::info!("Audio device initialization skipped (PT2_NO_AUDIO is set)");
+        return None;
     }
 
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (usize::MAX, None)
+    use crate::miniaudio_bindings::{
+        ma_device, ma_device_config_init, ma_device_init,
+        ma_device_type_ma_device_type_playback, ma_format_ma_format_f32,
+        ma_result_MA_SUCCESS,
+    };
+
+    let data_ptr = Arc::as_ptr(&callback_data) as *mut std::ffi::c_void;
+
+    // SAFETY: We provide a valid (stack-allocated, MaybeUninit) device pointer
+    // and a valid config. The callback and user-data pointers are valid for
+    // the lifetime of the returned AudioDevice.
+    unsafe {
+        let mut config = ma_device_config_init(ma_device_type_ma_device_type_playback);
+        config.dataCallback = Some(audio_callback);
+        config.pUserData = data_ptr;
+        config.playback.format = ma_format_ma_format_f32;
+        config.playback.channels = 2;
+        config.sampleRate = 44100;
+
+        let mut device = std::mem::MaybeUninit::<ma_device>::uninit();
+
+        let result = ma_device_init(std::ptr::null_mut(), &config, device.as_mut_ptr());
+
+        if result != ma_result_MA_SUCCESS {
+            log::error!("Failed to initialize miniaudio device (result={})", result);
+            return None;
+        }
+
+        let device = device.assume_init();
+
+        // NOTE: We do NOT call ma_device_start() here. The device is started
+        // lazily by AudioDevice::ensure_started() on the first play call.
+        // This avoids a race condition in miniaudio's worker thread that can
+        // cause an assertion failure (ma_device_state_starting) when starting
+        // the device during AudioManager construction.
+        log::info!("Miniaudio playback device initialized (lazy start)");
+
+        Some(AudioDevice {
+            device,
+            _callback_data: callback_data,
+            started: false,
+        })
     }
 }
 
-#[cfg(feature = "audio")]
-impl Source for InfiniteMixerSource {
-    #[inline]
-    fn current_frame_len(&self) -> Option<usize> {
-        None
-    }
+// =============================================================================
+// ActiveNote (non-feature-gated, used by MIDI playback logic)
+// =============================================================================
 
-    #[inline]
-    fn channels(&self) -> u16 {
-        self.channels
-    }
-
-    #[inline]
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    #[inline]
-    fn total_duration(&self) -> Option<Duration> {
-        None
-    }
-}
-
-/// Audio manager: tracks MIDI-derived sounds and playback state.
 /// Tracks a note that has been triggered (note_on) and is awaiting note_off.
 struct ActiveNote {
     midi_number: u8,
     end_time: f64,
 }
+
+// =============================================================================
+// AudioManager
+// =============================================================================
 
 pub struct AudioManager {
     midi_data: Option<MidiJson>,
@@ -134,19 +373,15 @@ pub struct AudioManager {
     muted: bool,
 
     #[cfg(feature = "audio")]
-    _stream: Option<OutputStream>,
+    audio_device: Option<AudioDevice>,
     #[cfg(feature = "audio")]
-    handle: Option<OutputStreamHandle>,
+    callback_data: Arc<AudioCallbackData>,
     #[cfg(feature = "audio")]
     samples: Arc<std::sync::RwLock<HashMap<String, DecodedSample>>>,
     #[cfg(feature = "audio")]
     sample_names: Vec<String>,
     #[cfg(feature = "audio")]
     assets_dir: Option<String>,
-    #[cfg(feature = "audio")]
-    mixer_controller: Option<Arc<rodio::dynamic_mixer::DynamicMixerController<f32>>>,
-    #[cfg(feature = "audio")]
-    _mixer_sink: Option<rodio::Sink>,
 
     // === Soundfont synthesis fields ===
     #[cfg(feature = "soundfont")]
@@ -164,54 +399,27 @@ pub struct AudioManager {
     #[cfg(feature = "soundfont")]
     soundfont_playback_active: bool,
     #[cfg(feature = "soundfont")]
-    soundfont_synth_arc: Option<SharedTsfHandle>,
-    #[cfg(feature = "soundfont")]
     soundfont_sample_rate: u32,
-}
-
-/// Create a mixer + infinite wrapper and attach to a Sink.
-/// Returns (controller, sink) or None if creation fails.
-#[cfg(feature = "audio")]
-fn create_mixer_and_sink(
-    handle: &OutputStreamHandle,
-) -> Option<(
-    Arc<rodio::dynamic_mixer::DynamicMixerController<f32>>,
-    rodio::Sink,
-)> {
-    let (controller, mixer_source) = rodio::dynamic_mixer::mixer::<f32>(2, 44100);
-    let infinite_source = InfiniteMixerSource {
-        inner: mixer_source,
-        channels: 2,
-        sample_rate: 44100,
-    };
-    if let Ok(sink) = rodio::Sink::try_new(handle) {
-        sink.append(infinite_source);
-        Some((controller, sink))
-    } else {
-        None
-    }
 }
 
 impl AudioManager {
     pub fn new() -> Self {
         #[cfg(feature = "audio")]
-        let (stream, handle) = match OutputStream::try_default() {
-            Ok((s, h)) => (Some(s), Some(h)),
-            Err(e) => {
-                log::error!("Failed to initialize rodio output stream: {}", e);
-                (None, None)
-            }
-        };
+        let callback_data = Arc::new(AudioCallbackData {
+            playing: Mutex::new(Vec::new()),
+            synth_buffer: Mutex::new(Vec::new()),
+            #[cfg(feature = "soundfont")]
+            synth: Mutex::new(None),
+        });
 
+        // NOTE: Audio device initialization is DEFERRED to initialize_samples().
+        // On Windows, ma_device_init() for the WASAPI backend calls
+        // CoInitializeEx(COINIT_MULTITHREADED), which conflicts with winit's
+        // OleInitialize() (which needs COINIT_APARTMENTTHREADED). By deferring
+        // init to initialize_samples() (called from winit's resumed() handler),
+        // we ensure the device is initialized AFTER the window is created.
         #[cfg(feature = "audio")]
-        let (mixer_controller, mixer_sink) = if let Some(ref h) = handle {
-            match create_mixer_and_sink(h) {
-                Some((c, s)) => (Some(c), Some(s)),
-                None => (None, None),
-            }
-        } else {
-            (None, None)
-        };
+        let audio_device: Option<AudioDevice> = None;
 
         Self {
             midi_data: None,
@@ -221,19 +429,15 @@ impl AudioManager {
             muted: false,
 
             #[cfg(feature = "audio")]
-            _stream: stream,
+            audio_device,
             #[cfg(feature = "audio")]
-            handle,
+            callback_data,
             #[cfg(feature = "audio")]
             samples: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "audio")]
             sample_names: Vec::new(),
             #[cfg(feature = "audio")]
             assets_dir: None,
-            #[cfg(feature = "audio")]
-            mixer_controller,
-            #[cfg(feature = "audio")]
-            _mixer_sink: mixer_sink,
 
             // === Soundfont fields (initialized to defaults) ===
             #[cfg(feature = "soundfont")]
@@ -251,8 +455,6 @@ impl AudioManager {
             #[cfg(feature = "soundfont")]
             soundfont_playback_active: false,
             #[cfg(feature = "soundfont")]
-            soundfont_synth_arc: None,
-            #[cfg(feature = "soundfont")]
             soundfont_sample_rate: 44100,
         }
     }
@@ -260,6 +462,27 @@ impl AudioManager {
     pub fn initialize_samples(&mut self, assets_dir: &str, preload: bool) {
         #[cfg(feature = "audio")]
         {
+            // Initialize the audio device NOW (deferred from new()).
+            // On Windows, ma_device_init() for WASAPI calls
+            // CoInitializeEx(COINIT_MULTITHREADED). This must happen AFTER
+            // winit has created its window, otherwise we get RPC_E_CHANGED_MODE.
+            // initialize_samples() is always called from the winit resumed()
+            // handler, ensuring the window exists before we touch the audio device.
+            //
+            // NOTE: We do NOT call ensure_started() here. The device start is
+            // deferred to the first actual play call. This avoids a timing
+            // sensitivity in miniaudio's WASAPI backend where the worker thread
+            // can hit an assertion (ma_device_state_starting) if ma_device_start()
+            // is called too soon after ma_device_init().
+            if self.audio_device.is_none() {
+                self.audio_device = init_audio_device(Arc::clone(&self.callback_data));
+                if self.audio_device.is_none() {
+                    log::warn!(
+                        "Audio device not available; audio playback will be silent"
+                    );
+                }
+            }
+
             self.assets_dir = Some(assets_dir.to_string());
             let piano_path = Path::new(assets_dir).join("sounds/mp3/piano");
 
@@ -293,29 +516,8 @@ impl AudioManager {
                             let name = name.clone();
                             let path = path.clone();
                             s.spawn(move || -> Option<(String, DecodedSample)> {
-                                let data = std::fs::read(&path).ok()?;
-                                let cursor = std::io::Cursor::new(data);
-                                let decoder = Decoder::new(cursor).ok()?;
-                                // Normalize to stereo and 44100Hz using UniformSourceIterator (matches Mixer)
-                                // We avoid .collect() here because of a bug in rodio 0.20.1's ChannelCountConverter::size_hint
-                                // which can cause a subtraction overflow panic during Vec pre-allocation.
-                                let uniform_source = rodio::source::UniformSourceIterator::new(
-                                    decoder.convert_samples::<f32>(),
-                                    2,
-                                    44100,
-                                );
-                                let mut decoded_data = Vec::new();
-                                for sample in uniform_source {
-                                    decoded_data.push(sample);
-                                }
-                                Some((
-                                    name,
-                                    DecodedSample {
-                                        data: Arc::from(decoded_data),
-                                        channels: 2,
-                                        sample_rate: 44100,
-                                    },
-                                ))
+                                decode_mp3_file(&path)
+                                    .map(|data| (name, DecodedSample { data }))
                             })
                         })
                         .collect();
@@ -396,31 +598,34 @@ impl AudioManager {
 
         match synth.load_soundfont(config) {
             Ok(()) => {
-                // Create SoundfontSource to feed audio to the mixer
-                let source = SoundfontSource::from_tinysf(synth);
+                // Extract the inner tsf handle from TinySFSynth so we can share
+                // it between the main-thread API (note_on/note_off) and the
+                // audio callback (render_audio).
+                let handle = synth.get_synth().take();
 
-                // Clone the synth arc before the source is moved into the mixer
-                let synth_arc = source.clone_synth_arc();
+                // Create a shared Arc to the raw handle.
+                let handle_arc =
+                    Arc::new(std::sync::Mutex::new(SendSyncTsfHandle::new(handle)));
 
-                // Store the synth arc and sample rate so we can recreate the
-                // SoundfontSource if the mixer is rebuilt (e.g. stop_all_samples).
-                self.soundfont_synth_arc = Some(synth_arc.clone());
-                self.soundfont_sample_rate = 44100;
+                // Create two synth wrappers that share the same underlying handle:
+                // - main_synth: stored in soundfont_synth for note_on/note_off from the game loop
+                // - callback_synth: stored in callback_data for render_audio from the audio thread
+                let main_synth = ArcSoundfontSynth::new(handle_arc.clone());
+                let callback_synth = ArcSoundfontSynth::new(handle_arc);
 
-                // Wrap in ArcSoundfontSynth for the trait object
-                let wrapped_synth = ArcSoundfontSynth::new(synth_arc);
-                self.soundfont_synth = Some(Box::new(wrapped_synth));
+                // Store in callback_data for audio rendering.
+                let callback_arc: Arc<dyn SoundfontSynth + Send + Sync> =
+                    Arc::new(callback_synth);
+                *self.callback_data.synth.lock().unwrap() = Some(callback_arc);
 
-                // Add the source to the mixer if available
-                if let Some(ref controller) = self.mixer_controller {
-                    controller.add(source);
-                    log::info!("Soundfont source added to mixer");
-                }
+                // Store in soundfont_synth for main-thread API calls.
+                self.soundfont_synth = Some(Box::new(main_synth));
 
                 self.soundfont_state = SoundfontState::Ready;
                 self.using_soundfont = true;
                 self.soundfont_path = Some(path_str);
                 self.soundfont_playback_active = true;
+                self.soundfont_sample_rate = 44100;
 
                 log::info!("Soundfont loaded successfully");
                 Ok(())
@@ -463,19 +668,6 @@ impl AudioManager {
     }
 
     #[cfg(feature = "soundfont")]
-    #[allow(dead_code)]
-    /// Start soundfont audio playback through the mixer.
-    /// This must be called after successfully loading a soundfont to route its audio output.
-    fn start_soundfont_playback(&mut self) {
-        if let Some(ref mut _synth_box) = self.soundfont_synth {
-            // This requires restructuring - for now we handle it in load_soundfont
-            // where we have access to the raw TinySFSynth
-            log::debug!("Soundfont playback routing not yet implemented");
-        }
-        self.soundfont_playback_active = true;
-    }
-
-    #[cfg(feature = "soundfont")]
     /// Enable or disable soundfont synthesis at runtime.
     pub fn set_soundfont_enabled(&mut self, enabled: bool) {
         self.soundfont_enabled = enabled;
@@ -508,35 +700,21 @@ impl AudioManager {
         if let Some(ref synth) = self.soundfont_synth {
             log::info!("Unloading soundfont...");
             synth.reset();
-            synth.reset();
         }
 
         self.soundfont_synth = None;
-        self.soundfont_synth_arc = None;
         self.soundfont_state = SoundfontState::Uninitialized;
         self.using_soundfont = false;
         self.soundfont_path = None;
 
-        log::info!("Soundfont unloaded");
-    }
+        // Clear the callback-side synth reference so the audio callback
+        // stops rendering soundfont audio.
+        #[cfg(feature = "audio")]
+        {
+            *self.callback_data.synth.lock().unwrap() = None;
+        }
 
-    #[cfg(feature = "soundfont")]
-    /// Re-add the soundfont source to the current mixer.
-    /// This must be called after the mixer is recreated (e.g. in stop_all_samples)
-    /// to restore audio output from the synthesizer.
-    fn readd_soundfont_to_mixer(&mut self) {
-        if !self.using_soundfont || !self.soundfont_enabled {
-            return;
-        }
-        let synth_arc = match &self.soundfont_synth_arc {
-            Some(arc) => arc.clone(),
-            None => return,
-        };
-        if let Some(ref controller) = self.mixer_controller {
-            let source = SoundfontSource::from_synth_arc(synth_arc, self.soundfont_sample_rate);
-            controller.add(source);
-            log::debug!("Soundfont source re-added to mixer after rebuild");
-        }
+        log::info!("Soundfont unloaded");
     }
 
     #[cfg(feature = "soundfont")]
@@ -548,7 +726,6 @@ impl AudioManager {
         }
         #[cfg(not(feature = "soundfont"))]
         {
-            // Return a static value when soundfont is not compiled
             SoundfontState::Disabled
         }
     }
@@ -775,7 +952,7 @@ impl AudioManager {
         played_note_ids
     }
 
-    pub fn play_note_by_midi(&self, midi_number: u8) {
+    pub fn play_note_by_midi(&mut self, midi_number: u8) {
         if self.muted {
             return;
         }
@@ -838,96 +1015,81 @@ impl AudioManager {
         self.active_notes.clear();
     }
 
-    pub fn play_sample(&self, filename: &str) {
+    pub fn play_sample(&mut self, filename: &str) {
         if self.muted {
             return;
         }
         #[cfg(feature = "audio")]
         {
-            if let Some(controller) = &self.mixer_controller {
-                // First check if the sample is already loaded (lazy cache or pre-loaded)
-                let is_loaded = self.samples.read().unwrap().contains_key(filename);
-
-                // If not loaded, but we have the assets directory (lazy loading mode)
-                if !is_loaded {
-                    if let Some(ref dir) = self.assets_dir {
-                        let path = Path::new(dir).join("sounds/mp3/piano").join(filename);
-                        let filename_string = filename.to_string();
-                        let controller_clone = Arc::clone(controller);
-                        let samples_clone = Arc::clone(&self.samples);
-
-                        // Spawn a detached thread to handle file IO and decoding so we NEVER block the main thread.
-                        std::thread::spawn(move || {
-                            if let Ok(file) = std::fs::File::open(&path) {
-                                let reader = std::io::BufReader::new(file);
-                                if let Ok(decoder) = Decoder::new(reader) {
-                                    log::debug!(
-                                        "Lazy loading and decoding audio sample in background: {}",
-                                        filename_string
-                                    );
-                                    let uniform_source = rodio::source::UniformSourceIterator::new(
-                                        decoder.convert_samples::<f32>(),
-                                        2,
-                                        44100,
-                                    );
-                                    let mut decoded_data = Vec::new();
-                                    for sample in uniform_source {
-                                        decoded_data.push(sample);
-                                    }
-
-                                    let decoded_sample = DecodedSample {
-                                        data: Arc::from(decoded_data),
-                                        channels: 2,
-                                        sample_rate: 44100,
-                                    };
-
-                                    // Instantly play the sample from the newly decoded arc without waiting for locking cycles
-                                    let source = SharedSource {
-                                        data: Arc::clone(&decoded_sample.data),
-                                        channels: decoded_sample.channels,
-                                        sample_rate: decoded_sample.sample_rate,
-                                        pos: 0,
-                                    };
-                                    controller_clone.add(source);
-
-                                    // Cache it safely on write lock
-                                    if let Ok(mut map) = samples_clone.write() {
-                                        map.insert(filename_string, decoded_sample);
-                                    }
-                                } else {
-                                    log::warn!(
-                                        "Failed to decode lazily loaded file: {}",
-                                        filename_string
-                                    );
-                                }
-                            } else {
-                                log::warn!("Lazy load sample file not found: {}", filename_string);
-                            }
-                        });
-                        return; // Return early, the background thread will push this to the controller directly.
-                    } else {
-                        log::warn!("Sample not found and no assets dir: {}", filename);
-                    }
+            // Lazily start the audio device on first play call.
+            // This ensures maximum time between ma_device_init() and
+            // ma_device_start(), avoiding a timing sensitivity in
+            // miniaudio's WASAPI backend on Windows.
+            if let Some(ref mut device) = self.audio_device {
+                if !device.is_started() {
+                    device.ensure_started();
                 }
+            } else {
+                return;
+            }
 
-                // If the sample exists (either from pre-load or a prior lazy-load), play it securely as zero-copy Arc.
+            // First check if the sample is already loaded (lazy cache or pre-loaded)
+            let is_loaded = self.samples.read().unwrap().contains_key(filename);
+
+            if is_loaded {
+                // Play from cache
                 if let Ok(sample_map) = self.samples.read()
                     && let Some(sample) = sample_map.get(filename)
                 {
                     log::debug!("Playing audio sample: {}", filename);
-                    let source = SharedSource {
+                    let playing = PlayingSample {
                         data: Arc::clone(&sample.data),
-                        channels: sample.channels,
-                        sample_rate: sample.sample_rate,
                         pos: 0,
                     };
-                    controller.add(source);
+                    self.callback_data.playing.lock().unwrap().push(playing);
                 }
+            } else if let Some(ref dir) = self.assets_dir {
+                // Not loaded yet — decode on a background thread and play.
+                let path = Path::new(dir).join("sounds/mp3/piano").join(filename);
+                let filename_string = filename.to_string();
+                let callback_data = Arc::clone(&self.callback_data);
+                let samples_clone = Arc::clone(&self.samples);
+
+                std::thread::spawn(move || {
+                    if let Some(decoded_data) = decode_mp3_file(&path) {
+                        log::debug!(
+                            "Lazy loaded and decoded audio sample in background: {}",
+                            filename_string
+                        );
+
+                        // Cache it
+                        let sample = DecodedSample {
+                            data: Arc::clone(&decoded_data),
+                        };
+                        if let Ok(mut map) = samples_clone.write() {
+                            map.insert(filename_string.clone(), sample);
+                        }
+
+                        // Instantly queue for playback
+                        let playing = PlayingSample {
+                            data: decoded_data,
+                            pos: 0,
+                        };
+                        callback_data.playing.lock().unwrap().push(playing);
+                    } else {
+                        log::warn!(
+                            "Failed to decode lazily loaded file: {}",
+                            filename_string
+                        );
+                    }
+                });
+            } else {
+                log::warn!("Sample not found and no assets dir: {}", filename);
             }
         }
     }
 
-    pub fn play_random_sample(&self) {
+    pub fn play_random_sample(&mut self) {
         if self.muted {
             return;
         }
@@ -937,14 +1099,15 @@ impl AudioManager {
                 return;
             }
 
-            if let Some(_handle) = &self.handle {
+            // Check that the device exists and is started (lazy init).
+            if self.audio_device.as_ref().map_or(false, |d| d.is_started()) {
                 if !self.sample_names.is_empty() {
                     use rand::Rng;
                     let mut rng = rand::thread_rng();
                     let random_index = rng.gen_range(0..self.sample_names.len());
-                    if let Some(filename) = self.sample_names.get(random_index) {
+                    if let Some(filename) = self.sample_names.get(random_index).cloned() {
                         log::debug!("Playing random sample: {}", filename);
-                        self.play_sample(filename);
+                        self.play_sample(&filename);
                     }
                 } else {
                     log::warn!("No samples available to play random sound");
@@ -953,7 +1116,7 @@ impl AudioManager {
         }
     }
 
-    pub fn play_game_over_chord(&self) {
+    pub fn play_game_over_chord(&mut self) {
         if self.muted {
             return;
         }
@@ -982,14 +1145,9 @@ impl AudioManager {
     pub fn stop_all_samples(&mut self) {
         #[cfg(feature = "audio")]
         {
-            // Resetting the mixer is the easiest way to stop all sounds.
-            if let (Some(handle), Some(old_sink)) = (&self.handle, &mut self._mixer_sink) {
-                old_sink.stop();
-                if let Some((controller, sink)) = create_mixer_and_sink(handle) {
-                    self.mixer_controller = Some(controller);
-                    self._mixer_sink = Some(sink);
-                }
-            }
+            // Clear all currently playing samples. The audio callback will see
+            // an empty vec and produce silence.
+            self.callback_data.playing.lock().unwrap().clear();
         }
 
         #[cfg(feature = "soundfont")]
@@ -998,11 +1156,6 @@ impl AudioManager {
             if let Some(ref synth) = self.soundfont_synth {
                 synth.reset();
             }
-
-            // Re-add the soundfont source to the newly created mixer.
-            // Without this, note_on() events fire but no audio is produced
-            // because the SoundfontSource that feeds the mixer was destroyed.
-            self.readd_soundfont_to_mixer();
         }
     }
 }

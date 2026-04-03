@@ -447,7 +447,7 @@ fn is_game_over(data: &GameData) -> bool {
     )
 }
 
-fn play_tile_sound(midi_loaded: bool, audio_manager: &AudioManager) {
+fn play_tile_sound(midi_loaded: bool, audio_manager: &mut AudioManager) {
     if !midi_loaded {
         audio_manager.play_random_sample();
     }
