@@ -12,8 +12,8 @@ use std::time::Duration;
 // Soundfont imports - conditionally compiled
 #[cfg(feature = "soundfont")]
 use super::soundfont_manager::{
-    ArcSoundfontSynth, FluidLiteSynth, SoundfontConfig, SoundfontError, SoundfontResult,
-    SoundfontSource, SoundfontState, SoundfontSynth, validate_soundfont_path,
+    ArcSoundfontSynth, SharedTsfHandle, SoundfontConfig, SoundfontError, SoundfontResult,
+    SoundfontSource, SoundfontState, SoundfontSynth, TinySFSynth, validate_soundfont_path,
 };
 
 /// Internal representation of a pre-decoded audio sample.
@@ -164,7 +164,7 @@ pub struct AudioManager {
     #[cfg(feature = "soundfont")]
     soundfont_playback_active: bool,
     #[cfg(feature = "soundfont")]
-    soundfont_synth_arc: Option<Arc<std::sync::Mutex<Option<fluidlite::Synth>>>>,
+    soundfont_synth_arc: Option<SharedTsfHandle>,
     #[cfg(feature = "soundfont")]
     soundfont_sample_rate: u32,
 }
@@ -380,7 +380,7 @@ impl AudioManager {
         log::info!("Loading soundfont from: {}", path_str);
 
         // Create new synthesizer
-        let mut synth = match FluidLiteSynth::new() {
+        let mut synth = match TinySFSynth::new() {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Failed to create synthesizer: {}", e);
@@ -392,13 +392,12 @@ impl AudioManager {
         let config = SoundfontConfig::new(&path_str)
             .with_sample_rate(44100)
             .with_voices(256)
-            .with_reverb(true)
-            .with_volume(0.8);
+            .with_volume(0.5);
 
         match synth.load_soundfont(config) {
             Ok(()) => {
                 // Create SoundfontSource to feed audio to the mixer
-                let source = SoundfontSource::from_fluidlite(synth);
+                let source = SoundfontSource::from_tinysf(synth);
 
                 // Clone the synth arc before the source is moved into the mixer
                 let synth_arc = source.clone_synth_arc();
@@ -470,7 +469,7 @@ impl AudioManager {
     fn start_soundfont_playback(&mut self) {
         if let Some(ref mut _synth_box) = self.soundfont_synth {
             // This requires restructuring - for now we handle it in load_soundfont
-            // where we have access to the raw FluidLiteSynth
+            // where we have access to the raw TinySFSynth
             log::debug!("Soundfont playback routing not yet implemented");
         }
         self.soundfont_playback_active = true;
@@ -508,7 +507,7 @@ impl AudioManager {
     pub fn unload_soundfont(&mut self) {
         if let Some(ref synth) = self.soundfont_synth {
             log::info!("Unloading soundfont...");
-            synth.all_notes_off();
+            synth.reset();
             synth.reset();
         }
 
@@ -637,7 +636,7 @@ impl AudioManager {
         {
             // Stop any playing notes on the synthesizer
             if let Some(ref synth) = self.soundfont_synth {
-                synth.all_notes_off();
+                synth.reset();
             }
         }
     }
@@ -653,7 +652,7 @@ impl AudioManager {
             self.stop_all_samples();
             #[cfg(feature = "soundfont")]
             if let Some(ref synth) = self.soundfont_synth {
-                synth.all_notes_off();
+                synth.reset();
             }
         } else {
             log::info!("Audio output unmuted");
@@ -787,8 +786,8 @@ impl AudioManager {
                 && self.soundfont_enabled
                 && let Some(ref synth) = self.soundfont_synth
             {
-                // Use velocity based on note or default to 100
-                let velocity = 100u8;
+                // Use velocity based on note or default to 96
+                let velocity = 96u8;
                 synth.note_on(0, midi_number, velocity);
                 log::debug!("Soundfont note ON: midi={}", midi_number);
                 return;
@@ -997,7 +996,7 @@ impl AudioManager {
         {
             // Stop all synthesizer notes
             if let Some(ref synth) = self.soundfont_synth {
-                synth.all_notes_off();
+                synth.reset();
             }
 
             // Re-add the soundfont source to the newly created mixer.

@@ -930,8 +930,8 @@ fn convert_to_midi_json(parts: &[ParsedPart]) -> MidiJson {
                                 time: 0.0,
                                 duration: 0.0,
                                 duration_ticks: tick_pos - note_start,
-                                velocity: 100.0 / 127.0,
-                                note_off_velocity: 64.0 / 127.0,
+                                velocity: 96.0 / 127.0,
+                                note_off_velocity: 0.0,
                             });
                             active_notes.remove(&msg.value);
                         }

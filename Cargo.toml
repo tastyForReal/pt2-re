@@ -7,7 +7,7 @@ description = "A FOSS Piano Tiles 2 clone"
 [features]
 default = []
 audio = ["dep:rodio"]
-soundfont = ["dep:fluidlite", "audio"]
+soundfont = ["audio"]
 
 [dependencies]
 wgpu = "24"
@@ -24,5 +24,6 @@ log = "0.4"
 env_logger = "0.11"
 regex-lite = "0.1"
 rodio = { version = "0.20", optional = true, features = ["mp3"] }
-fluidlite = { version = "0.2", optional = true }
-bindgen = "0.72.1"
+
+[build-dependencies]
+cc = "1"
