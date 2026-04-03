@@ -25,3 +25,4 @@ env_logger = "0.11"
 regex-lite = "0.1"
 rodio = { version = "0.20", optional = true, features = ["mp3"] }
 fluidlite = { version = "0.2", optional = true }
+bindgen = "0.72.1"
