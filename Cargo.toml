@@ -1,7 +1,7 @@
 [package]
 name = "pt2"
 version = "0.0.0"
-edition = "2024"
+edition = "2021"
 description = "A FOSS Piano Tiles 2 clone"
 
 [features]
